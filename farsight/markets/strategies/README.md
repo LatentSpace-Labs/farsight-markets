@@ -5,15 +5,25 @@
 Each strategy is a **composable pipeline** of reusable stages:
 
 ```
-Source → Enricher(s) → Analyzer(s) → Scorer → Filter → [Opportunity]
+Source → Enricher(s) → Analyzer(s) → Scorer → [Opportunity]
+                                                    │
+                                               Policy (Kelly, caps, dedup)
+                                                    │
+                                               Executor (paper trade + portfolio)
 ```
 
 Stages are independent classes with single-method interfaces:
 - `Source.fetch() → [MarketContext]` — fetch raw market data
 - `Enricher.enrich(ctx) → ctx` — add orderbook, history, themes
 - `Analyzer.analyze(ctx) → ctx` — compute features, detect patterns
-- `Scorer.score(ctx) → [Opportunity]` — convert analysis into trade ideas
-- `Filter.filter(opps) → opps` — remove low-quality opportunities
+- `Scorer.score(ctx) → [Opportunity]` — apply rules + quality gates inline;
+  emit only what passes
+
+There is no separate `Filter` stage any more. Quality gates (`min_edge`,
+`min_confidence`, `min_liquidity`, `max_spread`) are part of the scorer —
+it either emits an Opportunity that meets the rules, or nothing. Portfolio-
+level concerns (sizing, position caps, dedup against open trades) live in
+`policy.py`, not in strategies.
 
 Each stage can be reused independently — by other strategies, by API endpoints, or as tools in your own applications.
 
@@ -102,11 +112,11 @@ NearResolutionSource (Gamma API, markets resolving within 14 days)
   │     90% with 1 day left  → fair value ~97%
   │   Only markets with one outcome > 75% certainty
   │
-  → DiscountScorer
+  → DiscountScorer (rules + quality gates inline)
   │   Edge = fair_value - current_price
-  │   Direction: BUY the near-certain outcome at a discount
-  │
-  → QualityFilter (min discount 2%, min liquidity $5K)
+  │   Direction: BUY the leading outcome at a discount
+  │   Gates: min_edge, min_confidence, min_liquidity, max_spread
+  │          (all configured in config/strategies/resolution.yaml)
 ```
 
 **Monitor:** Closes at 97%+ (take profit) or entry-5% (stop loss).
@@ -186,11 +196,20 @@ Scanner           Arb            Resolution         Momentum
                               │
                     ┌─────────┴──────────┐
                     │                    │
-              Display in             Auto-trade
-              console               (if enabled)
-                                   Kelly sizing
-                                   Risk limits
-                                   Paper execution
+              Display in             Signal.from_opportunity
+              console                       │
+                                         Policy (policy.py)
+                                         ├─ Kelly sizing
+                                         ├─ max_concurrent_positions
+                                         ├─ duplicate-market dedup
+                                         └─ min_order_usd floor
+                                                │
+                                         Order (or telemetered reject)
+                                                │
+                                         Executor (executor.py)
+                                         ├─ Paper trade write
+                                         ├─ Portfolio update
+                                         └─ trade.open telemetry
 ```
 
 ## Reusable Stage Classes

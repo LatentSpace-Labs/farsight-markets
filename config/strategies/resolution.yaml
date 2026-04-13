@@ -1,0 +1,47 @@
+# ResolutionScalper config. Edit here; loaded by ResolutionConfig.load("resolution").
+# Missing fields fall back to Pydantic defaults in strategies/config.py + resolution_scalper.py.
+
+name: resolution
+enabled: true
+
+scope:
+  # Categories where convergence-to-certainty is a reasonable prior.
+  # Excludes entertainment, science, opinion polls — those don't resolve deterministically.
+  categories: [politics, geopolitics, sports, elections]
+  # Alternatively target specific scopes:
+  # tag_slugs: [elections, sports]
+  # event_slugs: [2028-presidential-election]
+  # market_slugs: [will-trump-win-2028]
+
+thresholds:
+  min_edge: 0.02          # 2% minimum — below this, fees + spread erase it
+  min_confidence: 0.80    # leader must be priced ≥ 80%
+  min_liquidity: 25000    # $25K orderbook depth — Polymarket's real floor
+  min_volume_24h: 1000    # drop dormant books
+  max_spread: 0.03        # 3% max spread — wider = illiquid/untradeable
+
+risk:
+  max_position_usd: 250   # 2.5% of a $10K portfolio
+  max_positions: 8        # focused portfolio; diversification sweet spot
+  stop_loss_pct: 0.05     # exit on a 5¢ adverse move
+  take_profit_price: 0.97 # exit at 97¢ — last 3¢ is high-risk, low-reward
+  kelly_fraction: 0.20    # fractional Kelly (tempered from full)
+
+scheduling:
+  scan_interval_seconds: 600   # 10 min — catches news-driven repricing
+  mode: scan
+
+params:
+  max_days: 7                  # most convergence edge lives inside a week
+  min_certainty: 0.80          # stricter gate → fewer but higher-quality trades
+  # Edge gate lives in thresholds.min_edge — single source of truth.
+
+  # Per-category convergence model. See ResolutionAnalyzer for the math.
+  #   horizon_days: window over which convergence plays out
+  #   convexity:    <1 snap-late (event-driven), =1 linear, >1 drift-early
+  #   strength:     prior that the current leader actually wins
+  convergence_profiles:
+    sports:      {horizon_days:  1.0, convexity: 0.30, strength: 0.98}
+    elections:   {horizon_days:  3.0, convexity: 0.50, strength: 0.95}
+    politics:    {horizon_days:  5.0, convexity: 0.70, strength: 0.88}
+    geopolitics: {horizon_days: 10.0, convexity: 1.50, strength: 0.75}

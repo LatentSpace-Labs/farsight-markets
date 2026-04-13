@@ -74,10 +74,13 @@ class PipelineRunner:
         auto_trade: bool = False,
         max_trades_per_scan: int = 3,
         stream_markets: int = 20,
+        resolution_config=None,
     ):
+        from farsight.markets.strategies.resolution_scalper import ResolutionConfig
         self.auto_trade = auto_trade
         self.max_trades_per_scan = max_trades_per_scan
         self.stream_markets = stream_markets
+        self._resolution_config = resolution_config or ResolutionConfig.load("resolution")
         self._running = False
         self._start_time: Optional[float] = None
 
@@ -124,7 +127,9 @@ class PipelineRunner:
         registry = {
             "scanner": lambda: OpportunityScanner(self.gamma, self.clob),
             "arb": lambda: CrossEventArb(self.gamma, self.clob),
-            "resolution": lambda: ResolutionScalper(self.gamma, self.clob),
+            "resolution": lambda: ResolutionScalper(
+                self.gamma, self.clob, config=self._resolution_config,
+            ),
             "cross_venue": lambda: CrossVenueArbitrage(self.gamma, kalshi),
             "momentum": lambda: MomentumTracker(self.state_engine),
         }
@@ -151,6 +156,42 @@ class PipelineRunner:
         self.signal_engine.set_session_id(session_id)
         self._warm_start_signal_filter()
         self.signal_engine.begin_warmup(settings.WARMUP_SECONDS)
+
+        # Telemetry: one JSONL per session; readers (tail/dashboard) tail it.
+        from farsight.markets import telemetry
+        from farsight.markets.policy import Policy, PolicyConfig
+        from farsight.markets.executor import Executor, SessionRef
+        self._telemetry = telemetry.TelemetrySink(session_id)
+        telemetry.set_sink(self._telemetry)
+        # Policy caps come from the resolution strategy's risk block when it's
+        # the only active strategy; otherwise fall back to conservative defaults.
+        # (A proper per-strategy policy routing comes when more strategies are
+        # migrated to the new shape.)
+        rc = self._resolution_config
+        active_only_resolution = list(self._strategies) and all(
+            s.name == "resolution" for s in self._strategies
+        )
+        if active_only_resolution:
+            policy_cfg = PolicyConfig(
+                max_concurrent_positions=rc.risk.max_positions,
+                kelly_fraction=rc.risk.kelly_fraction,
+                max_position_usd=rc.risk.max_position_usd,
+            )
+        else:
+            policy_cfg = PolicyConfig(
+                max_concurrent_positions=20,
+                kelly_fraction=portfolio.get("kelly_fraction", 0.15),
+                max_position_pct=portfolio.get("max_position_pct", 5.0),
+            )
+        self._policy = Policy(self.store, policy_cfg)
+        self._executor = Executor(self.store, SessionRef(session_id=session_id))
+        self._telemetry.emit(
+            "session.start",
+            strategies=self._requested_strategies,
+            auto_trade=self.auto_trade,
+            portfolio_balance=portfolio["current_balance"],
+        )
+        self._wire_bus_telemetry()
 
         print(f"  Mode:       {mode}")
         print(f"  Strategies: {strat_names}")
@@ -201,6 +242,11 @@ class PipelineRunner:
         await self.ws.stop()
         await self.gamma.close()
         await self.clob.close()
+        if getattr(self, "_telemetry", None):
+            self._telemetry.emit("session.end")
+            from farsight.markets import telemetry as _tel
+            _tel.set_sink(None)
+            self._telemetry.close()
 
         elapsed = (time.time() - self._start_time) / 60 if self._start_time else 0
         portfolio = self.store.get_portfolio()
@@ -217,6 +263,43 @@ class PipelineRunner:
         print()
 
     # ── Phase 0 helpers ──────────────────────────────────────────────
+
+    def _wire_bus_telemetry(self):
+        """Bridge event-bus topics to telemetry. Sampled for firehose topics.
+
+        Enriches tick/trade.print with a human-readable market slug resolved
+        from `self.token_to_question`, so the event feed shows
+        `tick  nba-lakers-win  mid=0.95` instead of orphan numbers.
+        """
+        import random
+
+        sink = self._telemetry
+
+        def _slug_for(msg: dict) -> str:
+            tid = msg.get("token_id") or ""
+            return (self.token_to_question.get(tid) or "?")[:40]
+
+        async def _on_signal(msg):
+            sink.emit("signal", **(msg if isinstance(msg, dict) else {"raw": str(msg)}))
+
+        async def _on_trade(msg):
+            sink.emit("trade.executed", **(msg if isinstance(msg, dict) else {"raw": str(msg)}))
+
+        async def _on_tick(msg):
+            # Sample 1-in-10 to keep JSONL manageable under heavy streams.
+            if random.random() < 0.1 and isinstance(msg, dict):
+                sink.emit("tick", slug=_slug_for(msg), **msg)
+
+        async def _on_trade_print(msg):
+            if isinstance(msg, dict):
+                sink.emit("trade.print", slug=_slug_for(msg), **msg)
+            else:
+                sink.emit("trade.print", raw=str(msg))
+
+        self.bus.subscribe("signal.generated", _on_signal)
+        self.bus.subscribe("trade.executed", _on_trade)
+        self.bus.subscribe("raw.price_tick", _on_tick)
+        self.bus.subscribe("raw.trade_print", _on_trade_print)
 
     def _warm_start_signal_filter(self):
         """Rebuild cooldown + dedup state from persisted recent signals.
@@ -245,31 +328,51 @@ class PipelineRunner:
 
     async def _scan_loop(self):
         """Periodically run scan strategies."""
+        from farsight.markets import telemetry as _tel
         while self._running:
             # Wait for next scan interval (use shortest strategy interval)
             min_interval = min(s.scan_interval_seconds for s in self._strategies if s.mode != StrategyMode.STREAM)
-            await asyncio.sleep(min_interval)
+            # Tick every 15s emitting a heartbeat so the dashboard shows
+            # liveness + time-to-next-scan. Cheap and decoupled from scans.
+            elapsed = 0
+            while elapsed < min_interval and self._running:
+                await asyncio.sleep(15)
+                elapsed += 15
+                portfolio = self.store.get_portfolio()
+                _tel.emit(
+                    "heartbeat",
+                    next_scan_in=max(0, min_interval - elapsed),
+                    open_positions=len(self.store.get_open_trades()),
+                    balance=portfolio.get("current_balance", 0),
+                    total_pnl=portfolio.get("total_pnl", 0),
+                )
             if self._running:
                 await self._run_scan_cycle()
 
     async def _run_scan_cycle(self):
         """Run all strategies and process opportunities."""
+        from farsight.markets import telemetry as _tel
         all_opps: list[Opportunity] = []
 
         for strategy in self._strategies:
+            t0 = time.time()
+            _tel.emit("scan.start", strategy=strategy.name)
             try:
-                # scan() works for all modes:
-                # - SCAN/HYBRID: runs the full pipeline
-                # - STREAM: returns and clears pending opportunities collected since last call
                 opps = await strategy.scan()
                 all_opps.extend(opps)
                 if opps:
                     mode_tag = f" {DIM}[stream]{RESET}" if strategy.mode == StrategyMode.STREAM else ""
                     print(f"  {ORANGE}{strategy.name}{RESET}: {len(opps)} opportunities{mode_tag}")
+                _tel.emit(
+                    "scan.end", strategy=strategy.name,
+                    elapsed_ms=int((time.time() - t0) * 1000),
+                    emitted=len(opps),
+                )
             except Exception as e:
                 logger.error(f"Strategy {strategy.name} scan failed: {e}")
+                _tel.emit("error", strategy=strategy.name, where="scan", message=str(e))
 
-        # Deduplicate by market_id (keep highest score)
+        # Dedup by market_id (keep highest score)
         seen = {}
         for opp in all_opps:
             key = opp.market_id
@@ -279,17 +382,17 @@ class PipelineRunner:
 
         self.all_opportunities = all_opps
 
-        # Display top opportunities
         if all_opps:
             self._print_opportunities(all_opps[:10])
         else:
             print(f"  {DIM}No opportunities found this scan.{RESET}")
 
-        # Auto-trade top opportunities
+        # Route every opportunity through Policy → Executor. Policy enforces
+        # caps, dedup vs open trades, sizing; Executor places the paper trade.
+        # No arbitrary top-k truncation.
         if self.auto_trade and all_opps:
-            await self._execute_top_opportunities(all_opps[:self.max_trades_per_scan])
+            await self._execute_top_opportunities(all_opps)
 
-        # Log to store
         for opp in all_opps[:20]:
             self.store.log_event("opportunity", json.dumps(opp.to_dict()))
 
@@ -317,7 +420,20 @@ class PipelineRunner:
     # ── Streaming ────────────────────────────────────────────────────
 
     async def _start_streaming(self):
-        """Start WebSocket streaming for markets with open positions or high opportunities."""
+        """Start WebSocket streaming for markets with open positions or high opportunities.
+
+        Skipped entirely if no active strategy consumes streaming data
+        (STREAM or HYBRID mode). SCAN-only runs don't burn bandwidth on
+        ticks that nothing will read.
+        """
+        needs_streams = any(
+            s.mode in (StrategyMode.STREAM, StrategyMode.HYBRID)
+            for s in self._strategies
+        )
+        if not needs_streams:
+            print(f"  {DIM}No streaming strategies active — skipping WS subscriptions.{RESET}")
+            return
+
         token_ids = set()
 
         # Stream markets we have positions in
@@ -413,72 +529,24 @@ class PipelineRunner:
     # ── Execution ────────────────────────────────────────────────────
 
     async def _execute_top_opportunities(self, opps: list[Opportunity]):
-        """Paper trade the top opportunities."""
-        portfolio = self.store.get_portfolio()
-        open_trades = self.store.get_open_trades()
+        """Route opportunities through Policy → Executor.
 
+        Opportunities are converted to Signals via the compat shim; once all
+        strategies emit Signals natively, this wrapper goes away.
+        """
+        from farsight.markets.strategies.types import Signal
         for opp in opps:
-            # Skip if already have a position in this market
-            if any(t.get("market_id") == opp.market_id for t in open_trades):
+            signal = Signal.from_opportunity(opp)
+            order = self._policy.apply(signal)
+            if order is None:
                 continue
-
-            # Position count limit
-            if len(open_trades) >= 20:
-                break
-
-            # Kelly sizing
-            if opp.edge <= 0 or opp.entry_price <= 0.01:
-                continue
-
-            b = (1.0 - opp.entry_price) / opp.entry_price
-            p = opp.entry_price + abs(opp.edge)
-            q = 1.0 - p
-            kelly = (p * b - q) / b
-            if kelly <= 0:
-                continue
-
-            fraction = kelly * portfolio.get("kelly_fraction", 0.15)
-            size_usd = round(portfolio["current_balance"] * fraction, 2)
-            max_size = portfolio["current_balance"] * (portfolio.get("max_position_pct", 5.0) / 100)
-            size_usd = min(size_usd, max_size)
-
-            if size_usd < 5:
-                continue
-
-            # Slippage
-            fill_price = opp.entry_price + opp.spread / 2
-            fill_price = max(0.01, min(0.99, fill_price))
-            num_shares = size_usd / fill_price
-
-            trade_id = str(uuid4())
-            trade = {
-                "id": trade_id,
-                "signal_id": None,
-                "market_id": opp.market_id,
-                "market_question": opp.market_question[:500],
-                "token_id": opp.token_id,
-                "outcome": opp.outcome,
-                "direction": opp.direction.upper(),
-                "entry_price": opp.entry_price,
-                "fill_price": fill_price,
-                "size_usd": size_usd,
-                "num_shares": num_shares,
-                "slippage_bps": (opp.spread / 2) * 10000,
-                "strategy": opp.strategy,
-                "session_id": self.session.session_id,
-            }
-            self.store.save_trade(trade)
-            self.session.increment("trades_opened")
-            self.store.update_portfolio(
-                current_balance=portfolio["current_balance"] - size_usd,
-                total_trades=portfolio["total_trades"] + 1,
-            )
-            portfolio = self.store.get_portfolio()
-            open_trades.append(trade)
-
-            print(f"  {GREEN}TRADE{RESET} {opp.direction.upper()} {opp.outcome} "
-                  f"${size_usd:.2f} @ {fill_price:.4f}  "
-                  f"{DIM}{opp.market_question[:45]}{RESET}")
+            fill = await self._executor.execute(order)
+            if fill and fill.trade_ids:
+                self.session.increment("trades_opened")
+                leg = fill.legs[0]
+                print(f"  {GREEN}TRADE{RESET} {leg.side.upper()} {leg.outcome_label} "
+                      f"${fill.size_usd:.2f} @ {fill.fill_prices[0]:.4f}  "
+                      f"{DIM}{opp.market_question[:45]}{RESET}")
 
     async def _execute_action(self, action: Action):
         """Execute a monitor action (close, stop-loss)."""
@@ -506,6 +574,21 @@ class PipelineRunner:
                 current_balance=portfolio["current_balance"] + trade["size_usd"] + pnl,
                 total_pnl=portfolio["total_pnl"] + pnl,
                 winning_trades=portfolio["winning_trades"] + (1 if pnl > 0 else 0),
+            )
+
+            from farsight.markets import telemetry as _tel
+            _tel.emit(
+                "trade.close", strategy=trade.get("strategy"),
+                trade_id=trade["id"], slug=trade.get("event_slug"),
+                exit=exit_price, pnl=round(pnl, 2), return_pct=round(return_pct, 2),
+                reason=action.reason, kind=action.action_type.value,
+            )
+            portfolio = self.store.get_portfolio()
+            _tel.emit(
+                "portfolio",
+                balance=portfolio["current_balance"],
+                total_pnl=portfolio["total_pnl"],
+                open_positions=len(self.store.get_open_trades()),
             )
 
             pnl_color = GREEN if pnl >= 0 else RED

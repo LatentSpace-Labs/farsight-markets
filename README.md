@@ -99,6 +99,13 @@ python -m farsight.markets <command> [options]
 | `stream` | Stream live WebSocket data (--seconds N) |
 | `tags` | List all Polymarket tag categories |
 | `status` | Show local store stats (signals, trades, portfolio) |
+| `kpi` | Realized-edge KPIs (hit rate at T+1h/4h/24h/final) |
+| `sessions` | List recent bot sessions |
+| `tail` | Live telemetry firehose (--kind, --strategy, --follow) |
+| `dashboard` | Rich TUI: portfolio, strategies, funnel, trades, feed |
+| `opps` | Page through every opportunity emitted this session |
+| `trades` | Page through every trade open/close this session |
+| `scans` | Page through every scan cycle with its funnel |
 | `serve` | Start the REST API server on :8001 |
 
 ### Pipeline Runner
@@ -114,10 +121,30 @@ python -m farsight.markets run --strategies scanner,arb
 python -m farsight.markets run --auto-trade
 
 # Include real-time WebSocket streaming
-python -m farsight.markets run --stream-markets 5
+python -m farsight.markets run --stream-markets 100
 ```
 
 Strategy names: `scanner`, `arb`, `resolution`, `cross_venue`, `momentum`
+
+### Live Observability
+
+Three terminals, no server needed. Everything writes to
+`~/.farsight/telemetry/<session>.jsonl`; both readers auto-switch when you
+restart the runner.
+
+```bash
+# Terminal 1 — the pipeline
+python -m farsight.markets run --strategies resolution --auto-trade
+
+# Terminal 2 — event firehose (every stage drop, signal, trade, heartbeat)
+python -m farsight.markets tail
+
+# Terminal 3 — live TUI dashboard
+python -m farsight.markets dashboard
+```
+
+Or launch all three at once from the **Live: Runner + Tail + Dashboard**
+compound in [.vscode/launch.json](.vscode/launch.json).
 
 ### REST API
 
@@ -163,13 +190,20 @@ farsight/markets/
 │   ├── correlation_service.py  # Cross-asset correlation (optional external data)
 │   └── replay_service.py #   Historical backtesting
 ├── strategies/           # 5 composable trading strategies
-│   ├── base.py           #   Strategy, Source, Enricher, Analyzer, Scorer, Filter protocols
+│   ├── base.py           #   Strategy, Source, Enricher, Analyzer, Scorer protocols
+│   ├── config.py         #   Shared StrategyConfig (scope/thresholds/risk/scheduling)
+│   ├── types.py          #   Leg / Signal / Order / Fill — the unified trade types
 │   ├── opportunity_scanner.py
 │   ├── cross_event_arb.py
 │   ├── resolution_scalper.py
 │   ├── cross_venue_arb.py
 │   ├── momentum_tracker.py
 │   └── venue_matcher.py  #   Cross-venue market matching (Polymarket <-> Kalshi)
+├── policy.py             # Signal → Order gate (Kelly sizing, caps, dedup)
+├── executor.py           # Order → Fill (paper trades, portfolio updates)
+├── telemetry.py          # JSONL session writer (live event stream)
+├── telemetry_tail.py     # `tail` CLI — live event firehose
+├── telemetry_dashboard.py# `dashboard` CLI — rich TUI
 ├── routes/               # FastAPI REST endpoints
 │   └── explore_routes.py #   Discovery, orderbook, features, analysis (public, no auth)
 ├── core/                 # Standalone utilities
@@ -180,6 +214,9 @@ farsight/markets/
 ├── app.py                # Standalone FastAPI server (:8001)
 └── cli.py                # CLI entry point
 ```
+
+Per-strategy config lives at `config/strategies/<name>.yaml`
+(e.g. [config/strategies/resolution.yaml](config/strategies/resolution.yaml)).
 
 ### Processing Pipeline
 
@@ -196,11 +233,21 @@ Layer 2 — State & Features
 
 Layer 3 — Signals & Strategies
   SignalEngine: 6 rule-based detectors + filter chain (cooldown, dedup, liquidity)
-  Strategies: composable pipelines (Source → Enricher → Analyzer → Scorer → Filter)
-  → Published to event bus: signal.generated
+  Strategies: Source → Enrich → Analyze → Score (rules + quality gates inline)
+  → Emit Opportunity / Signal (unified type; baskets supported via Signal.legs)
 
-Layer 4 — Delivery
-  Console display, paper trading, REST API, signal persistence (SQLite)
+Layer 4 — Policy & Execution
+  Policy: Signal → Order. Owns Kelly sizing, max_concurrent_positions,
+          duplicate-market dedup. Rejections telemetered with reason.
+  Executor: Order → Fill. Writes paper trade, updates portfolio,
+            emits trade.open / trade.close / portfolio events.
+
+Layer 5 — Delivery & Observability
+  Console display, REST API, SQLite persistence.
+  Telemetry: one JSONL per session at ~/.farsight/telemetry/<session>.jsonl.
+  `farsight tail`      — live, colour-coded event firehose.
+  `farsight dashboard` — rich TUI: portfolio, strategies, last-scan funnel,
+                         opportunities, trades, signals, event feed.
 ```
 
 ### Event Bus Topics
@@ -280,28 +327,41 @@ Core (required):
 Optional:
 - `gql[httpx]` — Goldsky on-chain data queries
 - `fastapi` + `uvicorn` — REST API server (only for `serve` command)
+- `rich` — TUI dashboard (only for `dashboard` command)
+- `pyyaml` — strategy config files
 
 ### Adding a New Strategy
 
-Strategies follow a composable pipeline pattern:
+A strategy owns `source → enrich → analyze → score` (rules + quality gates
+live in the scorer; no separate Filter stage). It emits `Opportunity`s
+(or `Signal`s natively); the runner funnels them through **Policy** (sizing,
+caps, dedup) and **Executor** (paper trade). Strategies never touch the
+store or portfolio directly.
 
 ```python
-from farsight.markets.strategies.base import Strategy, StrategyMode, Source, Analyzer, Scorer
+from farsight.markets.strategies.base import Strategy, StrategyMode
+from farsight.markets.strategies.config import StrategyConfig
 
 class MyStrategy(Strategy):
     name = "my_strategy"
     mode = StrategyMode.SCAN
-    interval_seconds = 300  # Run every 5 minutes
 
-    def build_pipeline(self):
-        return [
-            MySource(),          # Fetch market data
-            MyAnalyzer(),        # Compute analysis
-            MyScorer(),          # Score opportunities
-        ]
+    def __init__(self, config: StrategyConfig):
+        self.config = config
+        self.source = MySource(...)
+        self.analyzer = MyAnalyzer(...)
+        self.scorer = MyScorer(thresholds=config.thresholds)
+
+    async def scan(self) -> list[Opportunity]:
+        ctxs = await self.source.fetch()
+        analyzed = [self.analyzer.analyze(c) for c in ctxs]
+        return [o for c in analyzed for o in self.scorer.score(c)]
 ```
 
-See [strategies/README.md](strategies/README.md) for the full pipeline architecture and stage interfaces.
+Config lives in `config/strategies/<name>.yaml`. See
+[config/strategies/resolution.yaml](config/strategies/resolution.yaml) for
+scope / thresholds / risk / scheduling sections. Load with
+`MyConfig.load("my_strategy")`.
 
 ### Adding a New Feature
 

@@ -869,6 +869,27 @@ def main():
     p.add_argument("--port", type=int, default=8001)
     p.add_argument("--reload", action="store_true", default=True)
 
+    p = sub.add_parser("tail", help="Tail the live telemetry event log for the current session")
+    p.add_argument("--session", help="Session id (defaults to latest)")
+    p.add_argument("--kind", help="Comma-separated event kinds to include (e.g. stage.drop,signal)")
+    p.add_argument("--strategy", help="Filter to one strategy")
+    p.add_argument("--follow", action="store_true", help="Skip history and only show new events")
+
+    p = sub.add_parser("dashboard", help="Live TUI dashboard (rich-based)")
+    p.add_argument("--session", help="Session id (defaults to latest)")
+
+    p = sub.add_parser("opps", help="Page through all opportunities emitted this session")
+    p.add_argument("--session", help="Session id (defaults to latest)")
+    p.add_argument("--strategy", help="Filter to one strategy")
+
+    p = sub.add_parser("trades", help="Page through all trades (open+close) this session")
+    p.add_argument("--session", help="Session id (defaults to latest)")
+    p.add_argument("--strategy", help="Filter to one strategy")
+
+    p = sub.add_parser("scans", help="Page through all scan cycles + their funnels")
+    p.add_argument("--session", help="Session id (defaults to latest)")
+    p.add_argument("--strategy", help="Filter to one strategy")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -903,6 +924,29 @@ def main():
         return
     if args.command == "sessions":
         _cmd_sessions()
+        return
+    if args.command == "tail":
+        from farsight.markets.telemetry_tail import run_tail
+        run_tail(session=args.session,
+                 kinds=(args.kind.split(",") if args.kind else None),
+                 strategy=args.strategy,
+                 from_start=not args.follow)
+        return
+    if args.command == "dashboard":
+        from farsight.markets.telemetry_dashboard import run_dashboard
+        run_dashboard(session=args.session)
+        return
+    if args.command == "opps":
+        from farsight.markets.telemetry_pager import cmd_opps
+        cmd_opps(session=args.session, strategy=args.strategy)
+        return
+    if args.command == "trades":
+        from farsight.markets.telemetry_pager import cmd_trades
+        cmd_trades(session=args.session, strategy=args.strategy)
+        return
+    if args.command == "scans":
+        from farsight.markets.telemetry_pager import cmd_scans
+        cmd_scans(session=args.session, strategy=args.strategy)
         return
 
     cmds = {

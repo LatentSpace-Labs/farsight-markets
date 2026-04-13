@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 30.0
 
 
+def _fmt_dt(dt: datetime) -> str:
+    """Gamma wants RFC3339 with 'Z' for UTC — naive isoformat is rejected."""
+    if dt.tzinfo is None:
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    from datetime import timezone as _tz
+    return dt.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class GammaClient:
     """Async client for the Polymarket Gamma API."""
 
@@ -75,39 +83,86 @@ class GammaClient:
         exclude_tag_id: Optional[int] = None,
         order: Optional[str] = None,
         ascending: Optional[bool] = None,
+        *,
+        slugs: Optional[list[str]] = None,
+        condition_ids: Optional[list[str]] = None,
+        clob_token_ids: Optional[list[str]] = None,
+        liquidity_min: Optional[float] = None,
+        liquidity_max: Optional[float] = None,
+        volume_min: Optional[float] = None,
+        volume_max: Optional[float] = None,
+        end_date_min: Optional[datetime] = None,
+        end_date_max: Optional[datetime] = None,
+        include_tag: Optional[bool] = None,
     ) -> list[dict]:
         """Fetch markets from Gamma API with pagination.
 
         Args:
             active: Filter to active/tradable markets
             closed: Filter by closed status (default False = only open markets)
-            tag_id: Include only this tag
-            exclude_tag_id: Exclude this tag (use 102127 to filter out 5-min crypto)
+            tag_id: Include only this tag (single int per Gamma docs)
+            exclude_tag_id: Exclude this tag. Undocumented in public API — may be
+                silently ignored; the 5-min crypto skip in ResolutionScalper
+                still uses a slug-match for that reason.
             order: Sort field — volume_24hr (recommended), volume, liquidity, start_date,
                    end_date, competitive, closed_time
             ascending: Sort direction (default False = descending)
+            slugs / condition_ids / clob_token_ids: repeatable identifier filters
+            liquidity_min/max, volume_min/max: numeric range filters (sent to Gamma
+                as liquidity_num_min etc.)
+            end_date_min/max: ISO-8601 serialized temporal bounds
+            include_tag: include tag objects in each market response
         """
         client = await self._get_client()
-        params: dict = {"limit": limit, "offset": offset}
+        # Use a list-of-tuples so repeatable params (slug, condition_ids, …)
+        # serialize as `?slug=a&slug=b` rather than CSV.
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
         if active is not None:
-            params["active"] = str(active).lower()
+            params.append(("active", str(active).lower()))
         if closed is not None:
-            params["closed"] = str(closed).lower()
+            params.append(("closed", str(closed).lower()))
         if tag_id is not None:
-            params["tag_id"] = tag_id
+            params.append(("tag_id", str(tag_id)))
         if exclude_tag_id is not None:
-            params["exclude_tag_id"] = exclude_tag_id
+            params.append(("exclude_tag_id", str(exclude_tag_id)))
         if order:
-            params["order"] = order
+            params.append(("order", order))
         if ascending is not None:
-            params["ascending"] = str(ascending).lower()
+            params.append(("ascending", str(ascending).lower()))
+        for s in slugs or []:
+            params.append(("slug", s))
+        for cid in condition_ids or []:
+            params.append(("condition_ids", cid))
+        for tid in clob_token_ids or []:
+            params.append(("clob_token_ids", tid))
+        if liquidity_min is not None:
+            params.append(("liquidity_num_min", str(liquidity_min)))
+        if liquidity_max is not None:
+            params.append(("liquidity_num_max", str(liquidity_max)))
+        if volume_min is not None:
+            params.append(("volume_num_min", str(volume_min)))
+        if volume_max is not None:
+            params.append(("volume_num_max", str(volume_max)))
+        if end_date_min is not None:
+            params.append(("end_date_min", _fmt_dt(end_date_min)))
+        if end_date_max is not None:
+            params.append(("end_date_max", _fmt_dt(end_date_max)))
+        if include_tag is not None:
+            params.append(("include_tag", str(include_tag).lower()))
 
         try:
             resp = await client.get("/markets", params=params)
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
-            logger.error(f"Gamma API error fetching markets: {e.response.status_code}")
+            body = e.response.text[:500] if e.response is not None else ""
+            logger.error(
+                f"Gamma API {e.response.status_code} fetching markets: "
+                f"params={dict(params)} body={body}"
+            )
             return []
         except httpx.RequestError as e:
             logger.error(f"Gamma API request error: {e}")
@@ -163,22 +218,53 @@ class GammaClient:
         exclude_tag_id: Optional[int] = None,
         order: Optional[str] = None,
         ascending: Optional[bool] = None,
+        *,
+        tag_slug: Optional[str] = None,
+        slugs: Optional[list[str]] = None,
+        liquidity_min: Optional[float] = None,
+        liquidity_max: Optional[float] = None,
+        volume_min: Optional[float] = None,
+        volume_max: Optional[float] = None,
+        end_date_min: Optional[datetime] = None,
+        end_date_max: Optional[datetime] = None,
     ) -> list[dict]:
-        """Fetch events (grouped markets) from Gamma API."""
+        """Fetch events (grouped markets) from Gamma API.
+
+        Unlike /markets, /events accepts `tag_slug` directly — no ID lookup needed.
+        """
         client = await self._get_client()
-        params: dict = {"limit": limit, "offset": offset}
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
         if active is not None:
-            params["active"] = str(active).lower()
+            params.append(("active", str(active).lower()))
         if closed is not None:
-            params["closed"] = str(closed).lower()
+            params.append(("closed", str(closed).lower()))
         if tag_id is not None:
-            params["tag_id"] = tag_id
+            params.append(("tag_id", str(tag_id)))
         if exclude_tag_id is not None:
-            params["exclude_tag_id"] = exclude_tag_id
+            params.append(("exclude_tag_id", str(exclude_tag_id)))
+        if tag_slug:
+            params.append(("tag_slug", tag_slug))
         if order:
-            params["order"] = order
+            params.append(("order", order))
         if ascending is not None:
-            params["ascending"] = str(ascending).lower()
+            params.append(("ascending", str(ascending).lower()))
+        for s in slugs or []:
+            params.append(("slug", s))
+        if liquidity_min is not None:
+            params.append(("liquidity_min", str(liquidity_min)))
+        if liquidity_max is not None:
+            params.append(("liquidity_max", str(liquidity_max)))
+        if volume_min is not None:
+            params.append(("volume_min", str(volume_min)))
+        if volume_max is not None:
+            params.append(("volume_max", str(volume_max)))
+        if end_date_min is not None:
+            params.append(("end_date_min", _fmt_dt(end_date_min)))
+        if end_date_max is not None:
+            params.append(("end_date_max", _fmt_dt(end_date_max)))
 
         try:
             resp = await client.get("/events", params=params)
@@ -225,12 +311,44 @@ class GammaClient:
         """Fetch all available tags. Use tag IDs for filtering markets/events."""
         client = await self._get_client()
         try:
-            resp = await client.get("/tags")
+            resp = await client.get("/tags", params={"limit": 500})
             resp.raise_for_status()
             return resp.json()
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             logger.error(f"Gamma API error fetching tags: {e}")
             return []
+
+    async def get_tag_by_slug(self, slug: str) -> Optional[dict]:
+        """Fetch a single tag by slug."""
+        client = await self._get_client()
+        try:
+            resp = await client.get(f"/tags/slug/{slug}")
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError:
+            return None
+
+    async def resolve_tag_slugs(self, slugs: list[str]) -> dict[str, int]:
+        """Resolve tag slugs to IDs, cached on the client for the session.
+
+        /markets only accepts `tag_id`, not `tag_slug`. This helper fills
+        that asymmetry with a single cached lookup.
+        """
+        if not slugs:
+            return {}
+        cache = getattr(self, "_tag_slug_cache", None)
+        if cache is None:
+            cache = {}
+            for tag in await self.get_tags():
+                tslug = tag.get("slug")
+                tid = tag.get("id")
+                if tslug and tid is not None:
+                    try:
+                        cache[tslug] = int(tid)
+                    except (TypeError, ValueError):
+                        continue
+            self._tag_slug_cache = cache
+        return {s: cache[s] for s in slugs if s in cache}
 
     # ── Normalization ────────────────────────────────────────────────
 

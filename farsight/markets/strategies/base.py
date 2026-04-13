@@ -278,6 +278,15 @@ class Strategy(ABC):
         """Execute the full pipeline and return scored, filtered opportunities."""
         ...
 
+    async def tick(self):
+        """Unified output method: returns a list of Signals.
+
+        Default implementation wraps legacy `scan()`. Strategies that have
+        been migrated to the Signal model override this directly.
+        """
+        from farsight.markets.strategies.types import Signal
+        return [Signal.from_opportunity(o) for o in await self.scan()]
+
     async def on_state_update(self, payload: dict):
         """Handle live state update (stream/hybrid mode)."""
         pass
