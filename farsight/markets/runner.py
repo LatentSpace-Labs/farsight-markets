@@ -32,6 +32,8 @@ from farsight.markets.config import settings
 from farsight.markets.engine.checkpoint import MemoryCheckpointStore
 from farsight.markets.engine.event_bus import EventBus
 from farsight.markets.services.feature_engine import FeatureEngine
+from farsight.markets.services.outcome_tracker import OutcomeTracker
+from farsight.markets.services.session_service import SessionService
 from farsight.markets.services.signal_engine import SignalEngine
 from farsight.markets.services.state_engine import StateEngine
 from farsight.markets.store import LocalStore
@@ -89,9 +91,18 @@ class PipelineRunner:
         self.state_engine = StateEngine(event_bus=self.bus)
         self.feature_engine = FeatureEngine(self.state_engine, event_bus=self.bus)
 
+        # Phase 0: session + label-loop infrastructure
+        self.session = SessionService(self.store)
+        self.outcome_tracker = OutcomeTracker(self.store, clob=self.clob, gamma=self.gamma)
+        self.signal_engine = SignalEngine(
+            event_bus=self.bus,
+            on_emit=self._persist_and_track_signal,
+        )
+
         # Strategies
         self._strategies: list[Strategy] = []
-        self._load_strategies(strategies or ["scanner", "arb", "resolution"])
+        self._requested_strategies = strategies or ["scanner", "arb", "resolution"]
+        self._load_strategies(self._requested_strategies)
 
         # Tracking
         self.all_opportunities: list[Opportunity] = []
@@ -135,15 +146,27 @@ class PipelineRunner:
         strat_names = ", ".join(s.name for s in self._strategies)
         portfolio = self.store.get_portfolio()
 
+        # Phase 0: open a session and perform warm-start of the signal filter.
+        session_id = self.session.start(settings, self._requested_strategies, self.auto_trade)
+        self.signal_engine.set_session_id(session_id)
+        self._warm_start_signal_filter()
+        self.signal_engine.begin_warmup(settings.WARMUP_SECONDS)
+
         print(f"  Mode:       {mode}")
         print(f"  Strategies: {strat_names}")
         print(f"  Portfolio:  ${portfolio['current_balance']:,.2f}")
+        print(f"  Session:    {DIM}{session_id[:8]}{RESET}  "
+              f"{DIM}(warmup {settings.WARMUP_SECONDS}s){RESET}")
         print(f"  Store:      {DIM}{self.store.db_path}{RESET}")
         print()
 
         # Wire streaming pipeline (for hybrid/stream strategies)
         self.state_engine.wire(self.bus)
         self.feature_engine.wire(self.bus)
+        self.signal_engine.wire(self.bus)
+
+        # Kick off the outcome/resolution background loops
+        await self.outcome_tracker.start()
 
         # Wire stream-mode strategies to bus
         for strat in self._strategies:
@@ -174,16 +197,49 @@ class PipelineRunner:
     async def stop(self):
         self._running = False
         print(f"\n  {YELLOW}Shutting down...{RESET}")
+        await self.outcome_tracker.stop()
         await self.ws.stop()
         await self.gamma.close()
         await self.clob.close()
 
         elapsed = (time.time() - self._start_time) / 60 if self._start_time else 0
         portfolio = self.store.get_portfolio()
-        print(f"  Session: {elapsed:.1f}m | Opportunities found: {len(self.all_opportunities)} | "
+        health = self.signal_engine.get_health()
+        self.session.increment("signals_emitted", health["signals_generated"] - self.session.counts["signals_emitted"])
+        self.session.increment("signals_suppressed", health["signals_suppressed"] - self.session.counts["signals_suppressed"])
+        self.session.end()
+
+        print(f"  Session: {elapsed:.1f}m | Signals: {health['signals_generated']} "
+              f"(suppressed {health['signals_suppressed']}) | "
+              f"Opportunities: {len(self.all_opportunities)} | "
               f"PnL: ${portfolio['total_pnl']:+,.2f}")
         self.store.close()
         print()
+
+    # ── Phase 0 helpers ──────────────────────────────────────────────
+
+    def _warm_start_signal_filter(self):
+        """Rebuild cooldown + dedup state from persisted recent signals.
+
+        Eliminates duplicate-spam after a restart. Pulls signals from the
+        last COOLDOWN_WARMSTART_HOURS window (a superset of the cooldown
+        window — the dedup set benefits from the longer tail).
+        """
+        from datetime import timedelta as _td
+        since = (datetime.utcnow() - _td(hours=settings.COOLDOWN_WARMSTART_HOURS)).isoformat()
+        recent = self.store.get_signals_since(since)
+        if recent:
+            self.signal_engine.warm_start(recent)
+            logger.info(f"warm-start: reloaded {len(recent)} recent signals for cooldown/dedup")
+
+    def _persist_and_track_signal(self, payload: dict):
+        """on_emit hook: persist the signal and schedule outcome tracking."""
+        try:
+            self.store.save_signal(payload)
+        except Exception as e:
+            logger.warning(f"save_signal failed: {e}")
+        self.outcome_tracker.on_signal_emitted(payload)
+        self.session.increment("signals_emitted")
 
     # ── Scan Loop ────────────────────────────────────────────────────
 
@@ -409,8 +465,10 @@ class PipelineRunner:
                 "num_shares": num_shares,
                 "slippage_bps": (opp.spread / 2) * 10000,
                 "strategy": opp.strategy,
+                "session_id": self.session.session_id,
             }
             self.store.save_trade(trade)
+            self.session.increment("trades_opened")
             self.store.update_portfolio(
                 current_balance=portfolio["current_balance"] - size_usd,
                 total_trades=portfolio["total_trades"] + 1,

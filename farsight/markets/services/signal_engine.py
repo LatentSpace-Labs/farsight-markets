@@ -13,11 +13,12 @@ Design for testability:
   - evaluate() can be called directly without the bus
 """
 
+import hashlib
 import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 from uuid import uuid4
 
 from farsight.markets.config import settings
@@ -29,6 +30,16 @@ from farsight.markets.schemas.signals import (
     SignalStatus,
     SignalType,
 )
+
+
+def dedup_hash(market_id: str | None, signal_type: str, direction: str, market_price: float) -> str:
+    """Stable fingerprint used to squash duplicate emissions across restarts.
+
+    Rounded to 2 decimal places so that a signal firing twice from the same
+    conditions with slightly different prices still collapses.
+    """
+    payload = f"{market_id or ''}|{signal_type}|{direction}|{round(float(market_price or 0.0), 2)}"
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +238,15 @@ class SignalFilter:
         self._daily_count = 0
         self._daily_reset: datetime = datetime.utcnow()
         self._per_market_hourly: dict[str, list[datetime]] = defaultdict(list)
+        self._dedup_hashes: set[str] = set()       # content hashes of recent emissions
+        self._warmup_until: Optional[datetime] = None  # suppress all signals before this time
+
+    def begin_warmup(self, seconds: int):
+        """Suppress signal emissions for `seconds` from now. Called on boot."""
+        self._warmup_until = datetime.utcnow() + timedelta(seconds=seconds)
+
+    def is_in_warmup(self) -> bool:
+        return self._warmup_until is not None and datetime.utcnow() < self._warmup_until
 
     def check(self, signal: SignalSchema) -> tuple[bool, str]:
         """Run signal through all filters. Returns (passed, rejection_reason)."""
@@ -235,6 +255,19 @@ class SignalFilter:
         if (now - self._daily_reset).total_seconds() > 86400:
             self._daily_count = 0
             self._daily_reset = now
+
+        # 0. Warmup suppression (post-restart grace period while windows fill)
+        if self.is_in_warmup():
+            remaining = (self._warmup_until - now).total_seconds()
+            return False, f"warmup: {remaining:.0f}s remaining"
+
+        # 0b. Dedup: same content already emitted within the dedup window?
+        sig_hash = dedup_hash(
+            signal.market_id, signal.signal_type.value,
+            signal.direction.value, signal.market_price,
+        )
+        if sig_hash in self._dedup_hashes:
+            return False, "dedup: identical signal recently emitted"
 
         features = {}  # Features are in the signal evidence, extract what we need
         for ev in signal.evidence:
@@ -288,6 +321,45 @@ class SignalFilter:
         self._daily_count += 1
         market_key = str(signal.market_id)
         self._per_market_hourly[market_key].append(now)
+        self._dedup_hashes.add(dedup_hash(
+            signal.market_id, signal.signal_type.value,
+            signal.direction.value, signal.market_price,
+        ))
+
+    def warm_start(self, recent_signals: list[dict]):
+        """Rebuild cooldown + dedup state from persisted recent signals.
+
+        Called on boot so that a restart doesn't re-emit signals that were
+        already sent minutes earlier. `recent_signals` should be signals
+        from the last FILTER_COOLDOWN_MINUTES * 2 (or more) window.
+        """
+        now = datetime.utcnow()
+        cutoff = now - timedelta(minutes=settings.FILTER_COOLDOWN_MINUTES)
+        for s in recent_signals:
+            created_raw = s.get("created_at")
+            if not created_raw:
+                continue
+            try:
+                created = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+                if created.tzinfo is not None:
+                    created = created.replace(tzinfo=None)
+            except ValueError:
+                continue
+
+            market_id = s.get("market_id") or s.get("token_id")
+            stype = s.get("signal_type") or ""
+            direction = s.get("direction") or ""
+            price = float(s.get("market_price") or 0.0)
+
+            # Dedup set: keep hashes for all signals in window (drives dedup suppression).
+            self._dedup_hashes.add(dedup_hash(market_id, stype, direction, price))
+
+            # Cooldowns: only the most recent per (market, type), and only if still active.
+            if created >= cutoff:
+                key = f"{market_id}:{stype}"
+                prev = self._cooldowns.get(key)
+                if prev is None or created > prev:
+                    self._cooldowns[key] = created
 
     def reset(self):
         """Reset all filter state. Used in testing and replay."""
@@ -295,6 +367,8 @@ class SignalFilter:
         self._daily_count = 0
         self._daily_reset = datetime.utcnow()
         self._per_market_hourly.clear()
+        self._dedup_hashes.clear()
+        self._warmup_until = None
 
 
 # ── Signal Engine ────────────────────────────────────────────────────
@@ -317,12 +391,28 @@ class SignalEngine:
     and publishes survivors to the event bus.
     """
 
-    def __init__(self, event_bus: Optional[EventBus] = None):
+    def __init__(
+        self,
+        event_bus: Optional[EventBus] = None,
+        session_id: Optional[str] = None,
+        on_emit: Optional[Callable[[dict], None]] = None,
+    ):
         self._bus = event_bus
         self._filter = SignalFilter()
         self._signals_generated = 0
         self._signals_suppressed = 0
         self._active_signals: dict[str, SignalSchema] = {}  # id → signal
+        self._session_id = session_id
+        self._on_emit = on_emit  # e.g. store.save_signal or OutcomeTracker.on_signal_emitted
+
+    def set_session_id(self, session_id: str | None):
+        self._session_id = session_id
+
+    def begin_warmup(self, seconds: int):
+        self._filter.begin_warmup(seconds)
+
+    def warm_start(self, recent_signals: list[dict]):
+        self._filter.warm_start(recent_signals)
 
     def wire(self, bus: EventBus):
         self._bus = bus
@@ -353,13 +443,23 @@ class SignalEngine:
             self._signals_generated += 1
             self._active_signals[str(signal.id)] = signal
 
+            payload = signal.model_dump(mode="json")
+            if self._session_id:
+                payload["session_id"] = self._session_id
+
             if self._bus:
-                await self._bus.publish("signal.generated", signal.model_dump(mode="json"))
+                await self._bus.publish("signal.generated", payload)
                 logger.info(
                     f"Signal: {signal.signal_type.value} {signal.direction.value} "
                     f"conf={signal.confidence:.2f} edge={signal.edge:+.2%} "
                     f"token={token_id[:20]}..."
                 )
+
+            if self._on_emit is not None:
+                try:
+                    self._on_emit(payload)
+                except Exception as e:
+                    logger.warning(f"on_emit hook failed: {e}")
 
     def evaluate(self, features: dict, token_id: str, market_id: str | None = None) -> list[SignalSchema]:
         """Synchronous evaluation — run detectors without bus. For testing/API."""
@@ -379,6 +479,8 @@ class SignalEngine:
             "signals_suppressed": self._signals_suppressed,
             "active_signals": len(self._active_signals),
             "filter_daily_count": self._filter._daily_count,
+            "in_warmup": self._filter.is_in_warmup(),
+            "session_id": self._session_id,
         }
 
     def reset(self):

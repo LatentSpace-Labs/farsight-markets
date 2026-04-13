@@ -11,6 +11,9 @@ Tables:
   subscriptions   — watched markets/categories
   alert_rules     — user-defined alert conditions
   config          — key-value settings
+  sessions        — one row per bot run (Phase 0)
+  resolutions     — final resolved price per market (Phase 0)
+  signal_outcomes — price captures + realized edge per signal (Phase 0)
 """
 
 import json
@@ -138,13 +141,76 @@ class LocalStore:
                 created_at TEXT NOT NULL
             );
 
+            -- Phase 0: session lifecycle. One row per bot run.
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                config_hash TEXT,
+                strategies TEXT,
+                auto_trade INTEGER DEFAULT 0,
+                events_processed INTEGER DEFAULT 0,
+                signals_emitted INTEGER DEFAULT 0,
+                signals_suppressed INTEGER DEFAULT 0,
+                trades_opened INTEGER DEFAULT 0,
+                errors INTEGER DEFAULT 0,
+                notes TEXT
+            );
+
+            -- Phase 0: ground-truth resolutions. Populated by nightly poll.
+            CREATE TABLE IF NOT EXISTS resolutions (
+                market_id TEXT PRIMARY KEY,
+                token_id TEXT,
+                resolved_outcome TEXT,          -- 'YES' | 'NO' | 'INVALID' | 'UNKNOWN'
+                resolved_price REAL,            -- 1.0, 0.0, or split
+                resolved_at TEXT,               -- when the market closed
+                observed_at TEXT NOT NULL,      -- when we recorded it
+                source TEXT DEFAULT 'gamma'
+            );
+
+            -- Phase 0: signal outcome join. One row per emitted signal.
+            -- Price captures and realized-edge columns are filled over time.
+            CREATE TABLE IF NOT EXISTS signal_outcomes (
+                signal_id TEXT PRIMARY KEY,
+                market_id TEXT,
+                token_id TEXT,
+                signal_type TEXT,
+                direction TEXT,
+                entry_price REAL NOT NULL,
+                emitted_at TEXT NOT NULL,
+                price_t1h REAL,
+                price_t4h REAL,
+                price_t24h REAL,
+                resolved_price REAL,
+                realized_edge_1h REAL,
+                realized_edge_4h REAL,
+                realized_edge_24h REAL,
+                realized_edge_final REAL,
+                last_updated_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS ix_signals_type ON signals(signal_type);
             CREATE INDEX IF NOT EXISTS ix_signals_created ON signals(created_at);
             CREATE INDEX IF NOT EXISTS ix_trades_open ON paper_trades(is_open);
             CREATE INDEX IF NOT EXISTS ix_event_log_channel ON event_log(channel, id);
+            CREATE INDEX IF NOT EXISTS ix_outcomes_emitted ON signal_outcomes(emitted_at);
+            CREATE INDEX IF NOT EXISTS ix_outcomes_pending_t1h  ON signal_outcomes(emitted_at) WHERE price_t1h  IS NULL;
+            CREATE INDEX IF NOT EXISTS ix_outcomes_pending_t4h  ON signal_outcomes(emitted_at) WHERE price_t4h  IS NULL;
+            CREATE INDEX IF NOT EXISTS ix_outcomes_pending_t24h ON signal_outcomes(emitted_at) WHERE price_t24h IS NULL;
+            CREATE INDEX IF NOT EXISTS ix_sessions_started ON sessions(started_at);
         """)
+        # Additive column migrations for existing deployments.
+        self._add_column_if_missing("signals", "session_id", "TEXT")
+        self._add_column_if_missing("paper_trades", "session_id", "TEXT")
         conn.commit()
         logger.debug(f"Local store ready: {self.db_path}")
+
+    def _add_column_if_missing(self, table: str, column: str, coltype: str):
+        """Additive schema migration — SQLite has no native IF NOT EXISTS on ALTER."""
+        conn = self._get_conn()
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     def close(self):
         if self._conn:
@@ -159,8 +225,8 @@ class LocalStore:
             INSERT OR REPLACE INTO signals
             (id, market_id, event_id, token_id, signal_type, direction, confidence,
              horizon, tradability, model_probability, market_price, edge,
-             evidence, risk_flags, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             evidence, risk_flags, status, created_at, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             signal.get("id", ""),
             signal.get("market_id"),
@@ -178,8 +244,18 @@ class LocalStore:
             json.dumps(signal.get("risk_flags", [])),
             signal.get("status", "active"),
             signal.get("created_at", datetime.utcnow().isoformat()),
+            signal.get("session_id"),
         ))
         conn.commit()
+
+    def get_signals_since(self, since_iso: str) -> list[dict]:
+        """Recent signals — used for warm-start cooldown/dedup reconstruction."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM signals WHERE created_at >= ? ORDER BY created_at DESC",
+            (since_iso,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_recent_signals(self, limit: int = 20) -> list[dict]:
         conn = self._get_conn()
@@ -236,14 +312,15 @@ class LocalStore:
             INSERT INTO paper_trades
             (id, signal_id, market_id, market_question, token_id, outcome,
              direction, entry_price, fill_price, size_usd, num_shares,
-             slippage_bps, is_open, opened_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+             slippage_bps, is_open, opened_at, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         """, (
             trade["id"], trade.get("signal_id"), trade.get("market_id"),
             trade.get("market_question"), trade["token_id"], trade["outcome"],
             trade["direction"], trade["entry_price"], trade["fill_price"],
             trade["size_usd"], trade["num_shares"], trade.get("slippage_bps", 0),
             trade.get("opened_at", datetime.utcnow().isoformat()),
+            trade.get("session_id"),
         ))
         conn.commit()
 
@@ -357,3 +434,159 @@ class LocalStore:
             "portfolio_balance": portfolio["current_balance"],
             "portfolio_pnl": portfolio["total_pnl"],
         }
+
+    # ── Sessions (Phase 0) ───────────────────────────────────────────
+
+    def start_session(self, session_id: str, config_hash: str, strategies: str, auto_trade: bool) -> dict:
+        conn = self._get_conn()
+        now = datetime.utcnow().isoformat()
+        conn.execute("""
+            INSERT INTO sessions (id, started_at, config_hash, strategies, auto_trade)
+            VALUES (?, ?, ?, ?, ?)
+        """, (session_id, now, config_hash, strategies, 1 if auto_trade else 0))
+        conn.commit()
+        return {"id": session_id, "started_at": now}
+
+    def end_session(self, session_id: str, counts: dict | None = None):
+        conn = self._get_conn()
+        counts = counts or {}
+        conn.execute("""
+            UPDATE sessions SET
+                ended_at = ?,
+                events_processed = COALESCE(?, events_processed),
+                signals_emitted = COALESCE(?, signals_emitted),
+                signals_suppressed = COALESCE(?, signals_suppressed),
+                trades_opened = COALESCE(?, trades_opened),
+                errors = COALESCE(?, errors)
+            WHERE id = ?
+        """, (
+            datetime.utcnow().isoformat(),
+            counts.get("events_processed"),
+            counts.get("signals_emitted"),
+            counts.get("signals_suppressed"),
+            counts.get("trades_opened"),
+            counts.get("errors"),
+            session_id,
+        ))
+        conn.commit()
+
+    def get_recent_sessions(self, limit: int = 20) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Resolutions (Phase 0) ────────────────────────────────────────
+
+    def save_resolution(self, res: dict):
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT OR REPLACE INTO resolutions
+            (market_id, token_id, resolved_outcome, resolved_price, resolved_at, observed_at, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            res["market_id"], res.get("token_id"),
+            res.get("resolved_outcome"), res.get("resolved_price"),
+            res.get("resolved_at"),
+            res.get("observed_at", datetime.utcnow().isoformat()),
+            res.get("source", "gamma"),
+        ))
+        conn.commit()
+
+    def get_resolution(self, market_id: str) -> Optional[dict]:
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM resolutions WHERE market_id = ?", (market_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_unresolved_market_ids_with_signals(self) -> list[str]:
+        """Markets that have at least one outcome row without resolved_price."""
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT DISTINCT o.market_id FROM signal_outcomes o
+            LEFT JOIN resolutions r ON r.market_id = o.market_id
+            WHERE o.resolved_price IS NULL AND o.market_id IS NOT NULL
+        """).fetchall()
+        return [r["market_id"] for r in rows if r["market_id"]]
+
+    # ── Signal outcomes (Phase 0) ────────────────────────────────────
+
+    def create_signal_outcome(self, outcome: dict):
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT OR REPLACE INTO signal_outcomes
+            (signal_id, market_id, token_id, signal_type, direction,
+             entry_price, emitted_at, last_updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            outcome["signal_id"], outcome.get("market_id"), outcome.get("token_id"),
+            outcome.get("signal_type"), outcome.get("direction"),
+            outcome["entry_price"], outcome["emitted_at"],
+            datetime.utcnow().isoformat(),
+        ))
+        conn.commit()
+
+    def update_signal_outcome(self, signal_id: str, **fields):
+        if not fields:
+            return
+        fields["last_updated_at"] = datetime.utcnow().isoformat()
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        vals = list(fields.values()) + [signal_id]
+        conn = self._get_conn()
+        conn.execute(f"UPDATE signal_outcomes SET {sets} WHERE signal_id = ?", vals)
+        conn.commit()
+
+    def get_pending_outcome_captures(self, horizon_hours: int, now_iso: str, column: str) -> list[dict]:
+        """Return outcome rows whose emitted_at + horizon_hours <= now and `column` is still NULL.
+
+        Horizon hours must be in {1, 4, 24}; column is the corresponding price_tNh column.
+        """
+        assert column in {"price_t1h", "price_t4h", "price_t24h"}
+        conn = self._get_conn()
+        rows = conn.execute(f"""
+            SELECT * FROM signal_outcomes
+            WHERE {column} IS NULL
+              AND datetime(emitted_at, '+{horizon_hours} hours') <= ?
+            ORDER BY emitted_at ASC
+            LIMIT 500
+        """, (now_iso,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_signal_outcomes(self, limit: int = 200) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM signal_outcomes ORDER BY emitted_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def kpi_summary(self) -> dict:
+        """Aggregate KPIs across all outcomes with realized-edge data."""
+        conn = self._get_conn()
+        summary = {}
+        for horizon, col in [("1h", "realized_edge_1h"), ("4h", "realized_edge_4h"),
+                             ("24h", "realized_edge_24h"), ("final", "realized_edge_final")]:
+            row = conn.execute(f"""
+                SELECT
+                    COUNT({col}) AS n,
+                    AVG({col}) AS avg_edge,
+                    SUM(CASE WHEN {col} > 0 THEN 1 ELSE 0 END) AS wins
+                FROM signal_outcomes
+                WHERE {col} IS NOT NULL
+            """).fetchone()
+            n = row["n"] or 0
+            summary[horizon] = {
+                "n": n,
+                "avg_edge": row["avg_edge"] or 0.0,
+                "hit_rate": (row["wins"] / n) if n else 0.0,
+            }
+        by_type = conn.execute("""
+            SELECT signal_type,
+                   COUNT(realized_edge_1h) AS n,
+                   AVG(realized_edge_1h) AS avg_edge_1h,
+                   AVG(realized_edge_final) AS avg_edge_final
+            FROM signal_outcomes
+            WHERE realized_edge_1h IS NOT NULL
+            GROUP BY signal_type
+        """).fetchall()
+        summary["by_type"] = [dict(r) for r in by_type]
+        return summary

@@ -99,6 +99,13 @@ class MarketsPlatformSettings(BaseSettings):
     PAPER_DEFAULT_MAX_DAILY_LOSS: float = 500.0
     PAPER_DEFAULT_MAX_OPEN_POSITIONS: int = 20
 
+    # ── Session + outcome tracking (Phase 0) ─────────────────────────
+    WARMUP_SECONDS: int = 300                    # Suppress signals for first N seconds after boot
+    COOLDOWN_WARMSTART_HOURS: int = 2            # Load signals from this window to rebuild cooldowns/dedup
+    OUTCOME_CAPTURE_INTERVAL_SECONDS: int = 300  # How often to scan for pending outcome captures
+    RESOLUTION_POLL_INTERVAL_MINUTES: int = 60   # How often to poll Gamma for newly-resolved markets
+    OUTCOME_TRACKER_ENABLED: bool = True
+
     # ── Observability ────────────────────────────────────────────────
     SOURCE_LAG_ALERT_SECONDS: int = 120  # Alert if no WS message for 2 min
     END_TO_END_LATENCY_WARN_MS: int = 10_000  # 10 seconds

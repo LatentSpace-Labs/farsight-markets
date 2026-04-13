@@ -187,8 +187,9 @@ class TestSignalFilter:
         signal = self._make_signal()
         filt.record_emission(signal)
 
-        # Second signal same market+type should be blocked
-        signal2 = self._make_signal(id=uuid4(), market_id=signal.market_id)
+        # Second signal same market+type — different price so dedup doesn't
+        # collide, but cooldown on (market, signal_type) still blocks it.
+        signal2 = self._make_signal(id=uuid4(), market_id=signal.market_id, market_price=0.72)
         passed, reason = filt.check(signal2)
         assert not passed
         assert "cooldown" in reason

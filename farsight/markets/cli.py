@@ -712,6 +712,78 @@ def _cmd_status():
     print()
 
 
+def _cmd_kpi():
+    """Show KPIs computed from signal_outcomes. Phase 0 feedback loop."""
+    from farsight.markets.store import LocalStore
+
+    store = LocalStore()
+    summary = store.kpi_summary()
+
+    _header("Signal Quality KPIs")
+    print(f"  {'Horizon':<10} {'N':>6}  {'Hit rate':>10}  {'Avg edge':>12}")
+    print(f"  {DIM}{'-' * 44}{RESET}")
+    for horizon in ["1h", "4h", "24h", "final"]:
+        row = summary.get(horizon, {})
+        n = row.get("n", 0)
+        hit = row.get("hit_rate", 0.0)
+        avg = row.get("avg_edge", 0.0)
+        edge_color = GREEN if avg > 0 else (RED if avg < 0 else DIM)
+        if n == 0:
+            print(f"  {horizon:<10} {n:>6}  {DIM}{'—':>10}{RESET}  {DIM}{'—':>12}{RESET}")
+        else:
+            print(f"  {horizon:<10} {n:>6}  {hit:>9.1%}  {edge_color}{avg:>+11.4f}{RESET}")
+
+    by_type = summary.get("by_type") or []
+    if by_type:
+        _subheader("By signal type (1h horizon)")
+        print(f"  {'Type':<28} {'N':>5}  {'Avg 1h':>10}  {'Avg final':>12}")
+        print(f"  {DIM}{'-' * 60}{RESET}")
+        for r in by_type:
+            n = r.get("n") or 0
+            e1 = r.get("avg_edge_1h") or 0.0
+            ef = r.get("avg_edge_final")
+            ef_str = f"{ef:>+11.4f}" if ef is not None else f"{DIM}{'—':>12}{RESET}"
+            print(f"  {r['signal_type']:<28} {n:>5}  {e1:>+9.4f}  {ef_str}")
+    else:
+        print(f"\n  {DIM}No scored signals yet. Run the bot long enough for T+1h captures to land.{RESET}")
+
+    store.close()
+    print()
+
+
+def _cmd_sessions():
+    """List recent bot sessions."""
+    from farsight.markets.store import LocalStore
+
+    store = LocalStore()
+    sessions = store.get_recent_sessions(limit=20)
+
+    _header("Recent Sessions")
+    if not sessions:
+        print(f"  {DIM}No sessions recorded yet.{RESET}\n")
+        store.close()
+        return
+
+    print(f"  {'Started':<20} {'Dur':>6}  {'Sig':>4}  {'Supp':>5}  {'Trd':>4}  {'Strategies':<30} {'Config':<10}")
+    print(f"  {DIM}{'-' * 90}{RESET}")
+    for s in sessions:
+        started = (s.get("started_at") or "")[:19]
+        ended = s.get("ended_at")
+        if ended:
+            try:
+                dur_s = (datetime.fromisoformat(ended) - datetime.fromisoformat(s["started_at"])).total_seconds()
+                dur = f"{dur_s / 60:.0f}m"
+            except Exception:
+                dur = "?"
+        else:
+            dur = f"{DIM}live{RESET}"
+        print(f"  {started:<20} {dur:>6}  {s.get('signals_emitted', 0):>4}  "
+              f"{s.get('signals_suppressed', 0):>5}  {s.get('trades_opened', 0):>4}  "
+              f"{(s.get('strategies') or '')[:30]:<30} {DIM}{(s.get('config_hash') or '')[:8]}{RESET}")
+    store.close()
+    print()
+
+
 def cmd_serve(args):
     """Start the prediction markets API server."""
     import uvicorn
@@ -754,6 +826,9 @@ def main():
     p.add_argument("--stream-markets", type=int, default=20, help="Markets to stream via WebSocket")
 
     sub.add_parser("status", help="Show local store stats and portfolio")
+
+    sub.add_parser("kpi", help="Show signal-quality KPIs (hit rate, realized edge) from signal_outcomes")
+    sub.add_parser("sessions", help="List recent bot sessions")
 
     # Exploration
     sub.add_parser("health", help="Test API connectivity")
@@ -822,6 +897,12 @@ def main():
         return
     if args.command == "status":
         _cmd_status()
+        return
+    if args.command == "kpi":
+        _cmd_kpi()
+        return
+    if args.command == "sessions":
+        _cmd_sessions()
         return
 
     cmds = {
