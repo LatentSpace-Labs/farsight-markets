@@ -40,6 +40,22 @@ from farsight.markets.strategies.base import (
 logger = logging.getLogger(__name__)
 
 
+from typing import Literal as _Literal
+from pydantic import BaseModel as _BaseModel, Field as _Field
+from farsight.markets.strategies.config import StrategyConfig
+
+
+class MomentumParams(_BaseModel):
+    min_momentum: float = 0.3
+    min_volume_ratio: float = 1.5
+    cooldown_seconds: int = 300
+
+
+class MomentumConfig(StrategyConfig):
+    name: _Literal["momentum"] = "momentum"
+    params: MomentumParams = _Field(default_factory=MomentumParams)
+
+
 class MomentumTracker(Strategy):
     """Real-time momentum detection via streaming state updates.
 
@@ -63,7 +79,13 @@ class MomentumTracker(Strategy):
         min_momentum: float = 0.3,         # Minimum composite momentum score
         min_volume_ratio: float = 1.5,     # Minimum volume vs average
         cooldown_seconds: int = 300,        # 5 min between signals per token
+        config: Optional["MomentumConfig"] = None,
     ):
+        if config is not None:
+            min_momentum = config.params.min_momentum
+            min_volume_ratio = config.params.min_volume_ratio
+            cooldown_seconds = config.params.cooldown_seconds
+        self.config = config
         self._state_engine = state_engine
         self.min_momentum = min_momentum
         self.min_volume_ratio = min_volume_ratio

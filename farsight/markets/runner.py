@@ -75,11 +75,13 @@ class PipelineRunner:
         max_trades_per_scan: int = 3,
         stream_markets: int = 20,
         resolution_config=None,
+        detectors_trade: bool = False,
     ):
         from farsight.markets.strategies.resolution_scalper import ResolutionConfig
         self.auto_trade = auto_trade
         self.max_trades_per_scan = max_trades_per_scan
         self.stream_markets = stream_markets
+        self._detectors_trade = detectors_trade
         self._resolution_config = resolution_config or ResolutionConfig.load("resolution")
         self._running = False
         self._start_time: Optional[float] = None
@@ -115,23 +117,31 @@ class PipelineRunner:
         self._active_view: Optional[str] = None
 
     def _load_strategies(self, names: list[str]):
-        """Load strategy instances by name."""
-        from farsight.markets.strategies.opportunity_scanner import OpportunityScanner
-        from farsight.markets.strategies.cross_event_arb import CrossEventArb
+        """Load strategy instances by name, each driven by its YAML config."""
+        from farsight.markets.strategies.opportunity_scanner import OpportunityScanner, ScannerConfig
+        from farsight.markets.strategies.cross_event_arb import CrossEventArb, ArbConfig
         from farsight.markets.strategies.resolution_scalper import ResolutionScalper
-        from farsight.markets.strategies.cross_venue_arb import CrossVenueArbitrage
-        from farsight.markets.strategies.momentum_tracker import MomentumTracker
+        from farsight.markets.strategies.cross_venue_arb import CrossVenueArbitrage, CrossVenueConfig
+        from farsight.markets.strategies.momentum_tracker import MomentumTracker, MomentumConfig
         from farsight.markets.clients.kalshi.rest_client import KalshiClient
 
         kalshi = KalshiClient()
         registry = {
-            "scanner": lambda: OpportunityScanner(self.gamma, self.clob),
-            "arb": lambda: CrossEventArb(self.gamma, self.clob),
+            "scanner": lambda: OpportunityScanner(
+                self.gamma, self.clob, config=ScannerConfig.load("scanner"),
+            ),
+            "arb": lambda: CrossEventArb(
+                self.gamma, self.clob, config=ArbConfig.load("arb"),
+            ),
             "resolution": lambda: ResolutionScalper(
                 self.gamma, self.clob, config=self._resolution_config,
             ),
-            "cross_venue": lambda: CrossVenueArbitrage(self.gamma, kalshi),
-            "momentum": lambda: MomentumTracker(self.state_engine),
+            "cross_venue": lambda: CrossVenueArbitrage(
+                self.gamma, kalshi, config=CrossVenueConfig.load("cross_venue"),
+            ),
+            "momentum": lambda: MomentumTracker(
+                self.state_engine, config=MomentumConfig.load("momentum"),
+            ),
         }
 
         for name in names:
@@ -316,13 +326,54 @@ class PipelineRunner:
             logger.info(f"warm-start: reloaded {len(recent)} recent signals for cooldown/dedup")
 
     def _persist_and_track_signal(self, payload: dict):
-        """on_emit hook: persist the signal and schedule outcome tracking."""
+        """on_emit hook: persist the signal, schedule outcome tracking, and
+        (optionally) route through the same Policy+Executor path as
+        strategy opportunities — controlled by `self._detectors_trade`.
+        """
         try:
             self.store.save_signal(payload)
         except Exception as e:
             logger.warning(f"save_signal failed: {e}")
         self.outcome_tracker.on_signal_emitted(payload)
         self.session.increment("signals_emitted")
+
+        if getattr(self, "_detectors_trade", False) and self.auto_trade:
+            # Dispatch async — on_emit is called synchronously from SignalEngine.
+            try:
+                asyncio.get_event_loop().create_task(self._trade_detector_signal(payload))
+            except RuntimeError:
+                pass
+
+    async def _trade_detector_signal(self, payload: dict):
+        """Convert a SignalEngine payload → unified Signal → Policy → Executor."""
+        from farsight.markets.strategies.types import Leg, Signal as TradeSignal
+        try:
+            token_id = payload.get("market_id") or ""
+            if not token_id:
+                return
+            side = "buy" if payload.get("direction") == "bullish" else "sell"
+            price = float(payload.get("market_price") or 0)
+            edge = float(payload.get("edge") or 0)
+            confidence = float(payload.get("confidence") or 0)
+            sig_type = payload.get("signal_type") or "detector"
+
+            tsig = TradeSignal(
+                strategy=f"detector:{sig_type}",
+                legs=[Leg(market_id=token_id, token_id=token_id, side=side,
+                          target_price=price,
+                          outcome_label=self.token_to_question.get(token_id, "?")[:30])],
+                edge=abs(edge), confidence=confidence,
+                reason=f"SignalEngine {sig_type} {payload.get('direction')}",
+                liquidity=0,   # SignalEngine signals don't carry orderbook liq;
+                               # Policy's min_order_usd and Kelly sizing still apply.
+                spread=0,
+            )
+            order = self._policy.apply(tsig)
+            if order is None:
+                return
+            await self._executor.execute(order)
+        except Exception as e:
+            logger.debug(f"detector-signal trade routing failed: {e}")
 
     # ── Scan Loop ────────────────────────────────────────────────────
 
@@ -400,21 +451,28 @@ class PipelineRunner:
 
     async def _monitor_loop(self):
         """Periodically check open positions for stop-loss/take-profit."""
+        from farsight.markets import telemetry as _tel
         while self._running:
             await asyncio.sleep(60)
             if not self._running:
                 break
 
             open_trades = self.store.get_open_trades()
+            _tel.emit("monitor.tick", open=len(open_trades),
+                      strategies=[s.name for s in self._strategies])
             if not open_trades:
                 continue
 
             for strategy in self._strategies:
                 try:
                     actions = await strategy.monitor(open_trades)
+                    _tel.emit("monitor.done", strategy=strategy.name,
+                              actions=len(actions))
                     for action in actions:
                         await self._execute_action(action)
                 except Exception as e:
+                    _tel.emit("error", strategy=strategy.name,
+                              where="monitor", message=str(e))
                     logger.error(f"Strategy {strategy.name} monitor failed: {e}")
 
     # ── Streaming ────────────────────────────────────────────────────
@@ -549,52 +607,50 @@ class PipelineRunner:
                       f"{DIM}{opp.market_question[:45]}{RESET}")
 
     async def _execute_action(self, action: Action):
-        """Execute a monitor action (close, stop-loss)."""
-        if action.action_type in (ActionType.CLOSE, ActionType.STOP_LOSS):
-            trade = next((t for t in self.store.get_open_trades() if t["id"] == action.trade_id), None)
-            if not trade:
-                return
+        """Execute a monitor action (CLOSE / STOP_LOSS) via the Executor.
 
-            exit_price = action.exit_price or 0
-            entry = trade.get("entry_price", 0)
-            direction = trade.get("direction", "BUY")
-            num_shares = trade.get("num_shares", 0)
+        Turns the Action into a close-side Order and dispatches. All trade-row
+        updates, portfolio bookkeeping, and trade.close telemetry live in
+        Executor._close — this method no longer duplicates any of that.
+        """
+        if action.action_type not in (ActionType.CLOSE, ActionType.STOP_LOSS):
+            return
+        trade = next(
+            (t for t in self.store.get_open_trades() if t["id"] == action.trade_id),
+            None,
+        )
+        if not trade:
+            return
 
-            if direction == "BUY":
-                pnl = (exit_price - trade["fill_price"]) * num_shares
-            else:
-                pnl = (trade["fill_price"] - exit_price) * num_shares
+        from farsight.markets.strategies.types import Leg, Order
+        order = Order(
+            signal_ref=f"{action.action_type.value}:{action.reason[:60]}",
+            strategy=trade.get("strategy") or "",
+            legs=[Leg(
+                market_id=trade.get("market_id") or "",
+                token_id=trade.get("token_id") or "",
+                side="close",
+                target_price=action.exit_price or 0.0,
+                outcome_label=trade.get("outcome") or "",
+            )],
+            size_usd=0.0,          # close = zero-size by Executor convention
+            edge=0.0, confidence=0.0,
+        )
+        fill = await self._executor.execute(order)
+        if fill is None:
+            return
 
-            return_pct = (pnl / trade["size_usd"]) * 100 if trade["size_usd"] > 0 else 0
-
-            self.store.close_trade(trade["id"], exit_price, action.action_type.value, round(pnl, 2), round(return_pct, 2))
-
-            portfolio = self.store.get_portfolio()
-            self.store.update_portfolio(
-                current_balance=portfolio["current_balance"] + trade["size_usd"] + pnl,
-                total_pnl=portfolio["total_pnl"] + pnl,
-                winning_trades=portfolio["winning_trades"] + (1 if pnl > 0 else 0),
-            )
-
-            from farsight.markets import telemetry as _tel
-            _tel.emit(
-                "trade.close", strategy=trade.get("strategy"),
-                trade_id=trade["id"], slug=trade.get("event_slug"),
-                exit=exit_price, pnl=round(pnl, 2), return_pct=round(return_pct, 2),
-                reason=action.reason, kind=action.action_type.value,
-            )
-            portfolio = self.store.get_portfolio()
-            _tel.emit(
-                "portfolio",
-                balance=portfolio["current_balance"],
-                total_pnl=portfolio["total_pnl"],
-                open_positions=len(self.store.get_open_trades()),
-            )
-
-            pnl_color = GREEN if pnl >= 0 else RED
-            label = "CLOSE" if action.action_type == ActionType.CLOSE else "STOP"
-            print(f"  {YELLOW}{label}{RESET} {trade.get('outcome', '?')} "
-                  f"pnl={pnl_color}${pnl:+,.2f}{RESET}  {DIM}{action.reason}{RESET}")
+        # Executor already wrote paper_trades + portfolio + telemetry; just
+        # surface a console line for the human watching the runner.
+        closed_row = next(
+            (t for t in self.store.get_trade_history(limit=50) if t["id"] == trade["id"]),
+            None,
+        )
+        pnl = (closed_row or {}).get("pnl", 0.0) or 0.0
+        pnl_color = GREEN if pnl >= 0 else RED
+        label = "CLOSE" if action.action_type == ActionType.CLOSE else "STOP"
+        print(f"  {YELLOW}{label}{RESET} {trade.get('outcome', '?')} "
+              f"pnl={pnl_color}${pnl:+,.2f}{RESET}  {DIM}{action.reason}{RESET}")
 
     # ── Interactive Commands ─────────────────────────────────────────
 
@@ -1285,6 +1341,7 @@ async def run_pipeline(
     auto_trade: bool = False,
     max_trades: int = 3,
     stream_markets: int = 20,
+    detectors_trade: bool = False,
 ):
     """Entry point for running the bot."""
     suppress_loggers()
@@ -1294,6 +1351,7 @@ async def run_pipeline(
         auto_trade=auto_trade,
         max_trades_per_scan=max_trades,
         stream_markets=stream_markets,
+        detectors_trade=detectors_trade,
     )
 
     try:

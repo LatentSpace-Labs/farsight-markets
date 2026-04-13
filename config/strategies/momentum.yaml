@@ -1,0 +1,31 @@
+# MomentumTracker — real-time momentum detection from WebSocket feed.
+# Fires per-tick on streaming features (RSI crossings, multi-timeframe
+# alignment, volume-surge+momentum). STREAM-only; no scan pipeline.
+
+name: momentum
+enabled: true
+
+scope:
+  categories: []
+
+thresholds:
+  min_edge: 0.02
+  min_confidence: 0.50
+  min_liquidity: 10000
+  max_spread: 0.03
+
+risk:
+  max_position_usd: 150
+  max_positions: 6
+  stop_loss_pct: 0.03     # momentum flips fast — tight stop
+  take_profit_price: 0.85 # trend trades, not near-certain resolution
+  kelly_fraction: 0.15
+
+scheduling:
+  scan_interval_seconds: 0   # stream-driven; scan loop doesn't trigger this
+  mode: stream
+
+params:
+  min_momentum: 0.3        # composite momentum score threshold
+  min_volume_ratio: 1.5    # volume must be 1.5× recent average
+  cooldown_seconds: 300    # 5 min per token between signals

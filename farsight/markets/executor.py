@@ -56,7 +56,7 @@ class Executor:
                 "id": trade_id,
                 "signal_id": None,
                 "market_id": leg.market_id,
-                "market_question": order.signal_ref[:500],
+                "market_question": (order.market_question or order.signal_ref)[:500],
                 "token_id": leg.token_id,
                 "outcome": leg.outcome_label,
                 "direction": leg.side.upper(),
@@ -80,7 +80,8 @@ class Executor:
             telemetry.emit(
                 "trade.open", strategy=order.strategy,
                 trade_id=trade_id, market_id=leg.market_id,
-                slug=leg.outcome_label or order.signal_ref[:40],
+                slug=(order.market_question or leg.outcome_label or "?")[:60],
+                outcome=leg.outcome_label,
                 direction=leg.side, entry=fill_price,
                 size_usd=leg_size, edge=order.edge,
             )

@@ -50,6 +50,7 @@ class Policy:
                 size_usd=0.0,
                 edge=signal.edge,
                 confidence=signal.confidence,
+                market_question=signal.market_question,
             )
 
         portfolio = self.store.get_portfolio()
@@ -103,6 +104,7 @@ class Policy:
             size_usd=size_usd,
             edge=signal.edge,
             confidence=signal.confidence,
+            market_question=signal.market_question,
         )
         telemetry.emit(
             "policy.accept", strategy=signal.strategy,

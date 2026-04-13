@@ -202,6 +202,7 @@ class LocalStore:
         # Additive column migrations for existing deployments.
         self._add_column_if_missing("signals", "session_id", "TEXT")
         self._add_column_if_missing("paper_trades", "session_id", "TEXT")
+        self._add_column_if_missing("paper_trades", "strategy", "TEXT")
         conn.commit()
         logger.debug(f"Local store ready: {self.db_path}")
 
@@ -312,8 +313,8 @@ class LocalStore:
             INSERT INTO paper_trades
             (id, signal_id, market_id, market_question, token_id, outcome,
              direction, entry_price, fill_price, size_usd, num_shares,
-             slippage_bps, is_open, opened_at, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+             slippage_bps, is_open, opened_at, session_id, strategy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
         """, (
             trade["id"], trade.get("signal_id"), trade.get("market_id"),
             trade.get("market_question"), trade["token_id"], trade["outcome"],
@@ -321,6 +322,7 @@ class LocalStore:
             trade["size_usd"], trade["num_shares"], trade.get("slippage_bps", 0),
             trade.get("opened_at", datetime.utcnow().isoformat()),
             trade.get("session_id"),
+            trade.get("strategy"),
         ))
         conn.commit()
 

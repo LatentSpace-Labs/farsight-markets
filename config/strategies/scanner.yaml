@@ -1,0 +1,35 @@
+# OpportunityScanner — broad top-of-book market scanner.
+# Looks at the 50 highest-volume markets, computes 30 features, emits
+# feature-driven opportunities. Edges are small but frequent.
+
+name: scanner
+enabled: true
+
+scope:
+  # Scanner pulls top markets by volume; category allowlist isn't used,
+  # but you can narrow with tag_slugs when focusing on a theme.
+  categories: []
+
+thresholds:
+  min_edge: 0.015         # feature-based edges are smaller than resolution's
+  min_confidence: 0.50    # detectors are noisier, so a real confidence floor
+  min_liquidity: 10000    # $10K — scanner trades intraday moves, deeper books matter
+  min_volume_24h: 1000    # markets must have traded today
+  max_spread: 0.05        # 5% — wider than resolution since scanner plays mid-price
+
+risk:
+  max_position_usd: 150   # smaller per-trade; scanner fires more often
+  max_positions: 10       # broader book of positions
+  stop_loss_pct: 0.08     # roomier stop — intraday moves have noise
+  take_profit_price: 0.90 # scanner targets moves, not near-certain resolution
+  kelly_fraction: 0.15    # more conservative than resolution
+
+scheduling:
+  scan_interval_seconds: 300   # 5 min — short enough to catch intraday moves
+  mode: hybrid
+
+params:
+  max_markets: 50          # top-N by 24h volume
+  min_volume_24h: 1000     # strategy-side echo of the threshold above
+  price_range_low: 0.05    # skip near-certain 0¢ outcomes
+  price_range_high: 0.95   # skip near-certain 100¢ outcomes

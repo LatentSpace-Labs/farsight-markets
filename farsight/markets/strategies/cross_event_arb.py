@@ -23,7 +23,6 @@ from farsight.markets.clients.polymarket.gamma_client import GammaClient
 from farsight.markets.strategies.base import (
     Analyzer,
     Enricher,
-    Filter,
     MarketContext,
     Opportunity,
     Scorer,
@@ -225,6 +224,21 @@ class ArbScorer(Scorer):
 # ── Composed Strategy ────────────────────────────────────────────────
 
 
+from typing import Literal as _Literal
+from pydantic import BaseModel as _BaseModel, Field as _Field
+from farsight.markets.strategies.config import StrategyConfig
+
+
+class ArbParams(_BaseModel):
+    max_events: int = 30
+    min_deviation: float = 0.02
+
+
+class ArbConfig(StrategyConfig):
+    name: _Literal["arb"] = "arb"
+    params: ArbParams = _Field(default_factory=ArbParams)
+
+
 class CrossEventArb(Strategy):
     """Scan events for structural mispricing.
 
@@ -242,17 +256,25 @@ class CrossEventArb(Strategy):
         max_events: int = 30,
         min_deviation: float = 0.02,
         min_liquidity: float = 5000,
+        config: Optional[ArbConfig] = None,
     ):
         gamma = gamma or GammaClient()
+
+        if config is not None:
+            max_events = config.params.max_events
+            min_deviation = config.params.min_deviation
+            min_liquidity = config.thresholds.min_liquidity
+            self.scan_interval_seconds = config.scheduling.scan_interval_seconds
+        self.config = config
 
         self.source = ActiveEventsSource(gamma, limit=max_events)
         self.structural_analyzer = StructuralAnalyzer(min_deviation=min_deviation)
         self.arb_scorer = ArbScorer(min_deviation=min_deviation)
-        self.quality_filter = Filter(
-            min_edge=min_deviation / 10,  # Arb edges are smaller but more certain
-            min_liquidity=min_liquidity,
-            min_confidence=0.4,
-        )
+        # Arb edges are smaller but more certain, so min_edge is intentionally
+        # a fraction of min_deviation.
+        self.min_edge = min_deviation / 10
+        self.min_liquidity = min_liquidity
+        self.min_confidence = (config.thresholds.min_confidence if config else 0.4)
 
     async def scan(self) -> list[Opportunity]:
         # 1. Source
@@ -272,9 +294,16 @@ class CrossEventArb(Strategy):
             except Exception as e:
                 logger.debug(f"Arb: error processing {ctx.event_title[:40]}: {e}")
 
-        # 4. Filter
-        filtered = self.quality_filter.filter(all_opportunities)
-        logger.info(f"CrossEventArb: {len(all_opportunities)} raw → {len(filtered)} after filter")
+        filtered = [
+            o for o in all_opportunities
+            if abs(o.edge) >= self.min_edge
+            and o.liquidity >= self.min_liquidity
+            and o.confidence >= self.min_confidence
+        ]
+        for o in filtered:
+            o.compute_score()
+        filtered.sort(key=lambda o: o.score, reverse=True)
+        logger.info(f"CrossEventArb: {len(all_opportunities)} raw → {len(filtered)} qualified")
         return filtered
 
     def get_source(self) -> Source:

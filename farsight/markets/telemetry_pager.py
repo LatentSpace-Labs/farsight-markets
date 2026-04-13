@@ -90,9 +90,9 @@ def cmd_trades(session: Optional[str] = None, strategy: Optional[str] = None) ->
     table.add_column("time", style="dim", width=12)
     table.add_column("kind", width=6)
     table.add_column("strategy", width=10)
-    table.add_column("slug", overflow="fold", max_width=50)
-    table.add_column("dir", width=4)
-    table.add_column("price", justify="right")
+    table.add_column("market", overflow="fold", max_width=50)
+    table.add_column("side", style="magenta", width=14)
+    table.add_column("entry/exit", justify="right")
     table.add_column("size/pnl", justify="right")
     opens = closes = 0
     for ev in _iter_events(path, kinds={"trade.open", "trade.close"}, strategy=strategy):
@@ -116,7 +116,7 @@ def cmd_trades(session: Optional[str] = None, strategy: Optional[str] = None) ->
             kind_cell,
             ev.get("strategy") or "—",
             d.get("slug", "?") or "?",
-            (d.get("direction") or "").upper(),
+            d.get("outcome") or "—",
             f"{price:.3f}" if isinstance(price, (int, float)) else "—",
             Text(right, style=right_style),
         )

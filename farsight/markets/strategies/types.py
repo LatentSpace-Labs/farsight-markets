@@ -39,7 +39,8 @@ class Signal(BaseModel):
     legs: list[Leg]
     edge: float                        # expected return (fraction, e.g. 0.05)
     confidence: float                  # 0..1
-    reason: str                        # human-readable
+    reason: str                        # human-readable model reasoning
+    market_question: str = ""          # the actual market question (for display)
     features: dict = Field(default_factory=dict)  # provenance — what led here
 
     # Market quality context (single-market convenience; zero for baskets)
@@ -92,6 +93,7 @@ class Signal(BaseModel):
             edge=opp.edge,
             confidence=opp.confidence,
             reason=opp.reasoning or "",
+            market_question=opp.market_question or "",
             liquidity=opp.liquidity,
             spread=opp.spread,
             volume_24h=opp.volume_24h,
@@ -110,6 +112,7 @@ class Order(BaseModel):
     size_usd: float                    # total $ across legs
     edge: float
     confidence: float
+    market_question: str = ""          # carried through for DB bookkeeping
 
     @property
     def is_single(self) -> bool:

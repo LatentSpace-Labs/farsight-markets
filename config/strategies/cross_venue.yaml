@@ -1,0 +1,30 @@
+# CrossVenueArbitrage — price divergence between Polymarket and Kalshi
+# on semantically equivalent markets. Edge = |polymarket_price - kalshi_price|
+# after match confidence check.
+
+name: cross_venue
+enabled: true
+
+scope:
+  categories: []
+
+thresholds:
+  min_edge: 0.03          # 3% divergence — below this, fees + slippage eat it
+  min_confidence: 0.60    # match confidence floor; fuzzy matches are risky
+  min_liquidity: 5000     # per-venue floor (book not always fetched upstream)
+  max_spread: 0.05
+
+risk:
+  max_position_usd: 200
+  max_positions: 5        # cross-venue is capital-intensive (two legs)
+  stop_loss_pct: 0.05
+  take_profit_price: 0.98 # convergence is the thesis
+  kelly_fraction: 0.20
+
+scheduling:
+  scan_interval_seconds: 900   # 15 min — cross-venue state doesn't flip fast
+  mode: scan
+
+params:
+  min_spread: 0.03             # minimum cross-venue price divergence
+  min_match_confidence: 0.60   # same floor as thresholds.min_confidence

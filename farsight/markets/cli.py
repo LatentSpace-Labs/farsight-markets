@@ -824,6 +824,8 @@ def main():
     p.add_argument("--auto-trade", action="store_true", help="Enable auto paper trading")
     p.add_argument("--max-trades", type=int, default=3, help="Max trades per scan cycle")
     p.add_argument("--stream-markets", type=int, default=20, help="Markets to stream via WebSocket")
+    p.add_argument("--detectors-trade", action="store_true",
+                   help="Route SignalEngine detector signals through Policy+Executor (off by default)")
 
     sub.add_parser("status", help="Show local store stats and portfolio")
 
@@ -914,6 +916,7 @@ def main():
             auto_trade=args.auto_trade,
             max_trades=args.max_trades,
             stream_markets=args.stream_markets,
+            detectors_trade=args.detectors_trade,
         ))
         return
     if args.command == "status":

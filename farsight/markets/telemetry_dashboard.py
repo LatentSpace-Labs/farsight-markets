@@ -60,9 +60,31 @@ class DashboardState:
         self.portfolio = {"balance": 0.0, "total_pnl": 0.0, "open_positions": 0}
         self.next_scan_in: Optional[int] = None
         self.last_heartbeat_ts: Optional[str] = None
+        # Latest mark per open trade_id: {"mark", "mtm_value", "unrealized_pnl"}
+        self.marks: dict[str, dict] = {}
 
         self._lock = threading.Lock()
         self._current_scan: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
+
+    def load_trades(self, store: LocalStore) -> None:
+        """Seed the Trades panel with currently-open positions from SQLite
+        so carry-overs from prior sessions are visible immediately."""
+        with self._lock:
+            for t in store.get_open_trades():
+                self.trades.append({
+                    "ts": t.get("opened_at", ""),
+                    "kind": "trade.open",
+                    "trade_id": t.get("id"),
+                    "strategy": t.get("strategy") or "—",
+                    "slug": (t.get("market_question") or "?")[:60],
+                    "outcome": t.get("outcome") or "—",
+                    "direction": t.get("direction", ""),
+                    "entry": t.get("fill_price"),
+                    "exit": None,
+                    "size_usd": t.get("size_usd"),
+                    "pnl": None,
+                    "reason": "(carried over)",
+                })
 
     def ingest(self, ev: dict) -> None:
         kind = ev.get("kind")
@@ -120,11 +142,23 @@ class DashboardState:
                     "edge": data.get("edge"),
                 })
 
+            elif kind == "position.mark":
+                tid = data.get("trade_id")
+                if tid:
+                    self.marks[tid] = {
+                        "mark": data.get("mark"),
+                        "mtm_value": data.get("mtm_value"),
+                        "unrealized_pnl": data.get("unrealized_pnl"),
+                    }
+
             elif kind in ("trade.open", "trade.close"):
                 self.trades.append({
                     "ts": ev.get("ts", ""),
                     "kind": kind,
+                    "trade_id": data.get("trade_id"),
+                    "strategy": strategy or "—",
                     "slug": data.get("slug", "?"),
+                    "outcome": data.get("outcome") or "—",
                     "direction": data.get("direction", ""),
                     "entry": data.get("entry"),
                     "exit": data.get("exit"),
@@ -168,6 +202,9 @@ def _reader_thread(
     state_box: dict,
     stop: threading.Event,
 ) -> None:
+    # SQLite connections are bound to the creating thread, so the reader
+    # owns its own LocalStore. The main thread keeps its own for rendering.
+    store = LocalStore()
     """Read the session JSONL. If the latest-session pointer changes
     (runner restart), reopen the new file and swap in a fresh DashboardState
     so stale scan/opp data clears.
@@ -200,6 +237,7 @@ def _reader_thread(
             if new_path.is_file():
                 fh.close()
                 state_box["state"] = DashboardState()
+                state_box["state"].load_trades(store)
                 path = new_path
                 current_session = new_session
                 fh = path.open("r", encoding="utf-8")
@@ -223,10 +261,20 @@ def _header_panel(state: DashboardState, store: LocalStore) -> Panel:
     total_pnl = state.portfolio["total_pnl"] or portfolio.get("total_pnl", 0)
     open_trades = store.get_open_trades()
     open_n = len(open_trades) or state.portfolio["open_positions"]
-    # Exposure = notional $ sitting in open positions (cash already committed).
-    # Equity = cash + exposure — the real portfolio value.
+    # Exposure = cost basis sitting in open positions.
+    # MtM value = live mark × num_shares, from position.mark telemetry.
+    # Equity = cash + MtM (falls back to exposure when marks aren't in yet).
     exposure = sum(t.get("size_usd", 0) for t in open_trades)
-    equity = cash + exposure
+    mtm_value = sum(
+        (state.marks.get(t["id"]) or {}).get("mtm_value")
+        or t.get("size_usd", 0)           # fallback before first mark lands
+        for t in open_trades
+    )
+    unrealized = sum(
+        (state.marks.get(t["id"]) or {}).get("unrealized_pnl") or 0
+        for t in open_trades
+    )
+    equity = cash + mtm_value
     total_trades = portfolio.get("total_trades", 0)
     wins = portfolio.get("winning_trades", 0)
     win_rate = f"{wins/total_trades:.0%}" if total_trades else "—"
@@ -234,14 +282,16 @@ def _header_panel(state: DashboardState, store: LocalStore) -> Panel:
     mode = "[bold green]AUTO-TRADE[/]" if state.auto_trade else "[bold cyan]MONITOR[/]"
     pnl_style = "green" if total_pnl >= 0 else "red"
     next_scan = f"next scan [bold]{state.next_scan_in}s[/]  " if state.next_scan_in is not None else ""
+    unreal_style = "green" if unrealized >= 0 else "red"
     line = Text.from_markup(
         f"session [bold]{state.session_id or '—'}[/]  "
         f"uptime [bold]{uptime}[/]  "
         f"{mode}  {next_scan}"
         f"│  equity [bold]${equity:,.2f}[/]  "
         f"cash [bold]${cash:,.2f}[/]  "
-        f"exposure [dim]${exposure:,.2f}[/]  "
-        f"pnl [{pnl_style}]${total_pnl:+,.2f}[/]  "
+        f"mtm [dim]${mtm_value:,.2f}[/]  "
+        f"unreal [{unreal_style}]${unrealized:+,.2f}[/]  "
+        f"realized [{pnl_style}]${total_pnl:+,.2f}[/]  "
         f"open [bold]{open_n}[/]  "
         f"win% [bold]{win_rate}[/] ({wins}/{total_trades})"
     )
@@ -281,13 +331,13 @@ def _last_scan_panel(state: DashboardState) -> Panel:
 
 
 def _opportunities_panel(state: DashboardState) -> Panel:
-    t = Table(show_header=True, header_style="bold", padding=(0, 1))
-    t.add_column("strategy", style="dim", width=10)
-    t.add_column("slug", overflow="ellipsis", max_width=38)
-    t.add_column("price", justify="right")
-    t.add_column("fv", justify="right")
-    t.add_column("edge", justify="right")
-    t.add_column("liq", justify="right", style="dim")
+    t = Table(show_header=True, header_style="bold", padding=(0, 1), expand=True)
+    t.add_column("strategy", style="dim", width=10, no_wrap=True)
+    t.add_column("slug", overflow="ellipsis", ratio=1, no_wrap=True)
+    t.add_column("price", justify="right", width=5)
+    t.add_column("fv", justify="right", width=5)
+    t.add_column("edge", justify="right", width=7)
+    t.add_column("liq", justify="right", style="dim", width=10)
     for o in list(state.opportunities)[-25:]:
         edge = o["edge"]
         edge_style = "bold magenta" if edge > 0 else "red"
@@ -303,30 +353,50 @@ def _opportunities_panel(state: DashboardState) -> Panel:
 
 
 def _trades_panel(state: DashboardState) -> Panel:
-    t = Table(show_header=True, header_style="bold", padding=(0, 1))
-    t.add_column("time", style="dim", width=8)
-    t.add_column("kind", width=5)
-    t.add_column("slug", overflow="ellipsis", max_width=32)
-    t.add_column("dir", width=4)
-    t.add_column("price", justify="right")
-    t.add_column("size/pnl", justify="right")
+    t = Table(show_header=True, header_style="bold", padding=(0, 1), expand=True)
+    t.add_column("time", style="dim", width=8, no_wrap=True)
+    t.add_column("kind", width=5, no_wrap=True)
+    t.add_column("strategy", style="cyan", width=10, no_wrap=True)
+    t.add_column("market", overflow="ellipsis", ratio=1, no_wrap=True)
+    t.add_column("side", style="magenta", width=12, no_wrap=True)
+    t.add_column("entry", justify="right", width=6)
+    t.add_column("mark", justify="right", width=6)
+    t.add_column("pnl / $", justify="right", width=10)
     for tr in list(state.trades)[-25:]:
         is_open = tr["kind"] == "trade.open"
         kind_cell = Text("OPEN" if is_open else "CLOSE",
                          style="bold green" if is_open else "yellow")
-        price = tr["entry"] if is_open else tr["exit"]
-        price_cell = f"{price:.3f}" if isinstance(price, (int, float)) else "—"
+        entry = tr.get("entry")
+        entry_cell = f"{entry:.3f}" if isinstance(entry, (int, float)) else "—"
+
+        # mark + pnl column — live for opens, realized for closes
+        mark_cell = "—"
         if is_open:
-            right = f"${tr.get('size_usd', 0):.0f}"
-            right_style = "dim"
+            mark_info = state.marks.get(tr.get("trade_id")) if hasattr(state, "marks") else None
+            if mark_info and mark_info.get("mark") is not None:
+                mark_cell = f"{mark_info['mark']:.3f}"
+                upnl = mark_info.get("unrealized_pnl")
+                if upnl is not None:
+                    right = f"${upnl:+.2f}"
+                    right_style = "green" if upnl >= 0 else "red"
+                else:
+                    right = f"${tr.get('size_usd', 0):.0f}"
+                    right_style = "dim"
+            else:
+                right = f"${tr.get('size_usd', 0):.0f}"
+                right_style = "dim"
         else:
+            mark_cell = f"{tr.get('exit', 0):.3f}" if isinstance(tr.get("exit"), (int, float)) else "—"
             pnl = tr.get("pnl") or 0
             right = f"${pnl:+.2f}"
             right_style = "green" if pnl >= 0 else "red"
+
+        strategy_cell = (tr.get("strategy") or "—")[:12]
+        outcome = tr.get("outcome") or "—"
         t.add_row(
-            tr["ts"][11:19], kind_cell, tr["slug"],
-            tr.get("direction", "") or "",
-            price_cell,
+            tr["ts"][11:19], kind_cell, strategy_cell, tr["slug"],
+            outcome[:12],
+            entry_cell, mark_cell,
             Text(right, style=right_style),
         )
     return Panel(t, title="Trades", border_style="green")
@@ -361,20 +431,22 @@ def _render(state: DashboardState, store: LocalStore) -> Layout:
     )
     layout["body"].split_row(Layout(name="left"), Layout(name="right"))
     layout["left"].split(
-        Layout(name="strategies", size=6),
+        Layout(name="strategies", size=5),
         Layout(name="scan", ratio=1),
     )
+    # Right column: trades is the primary panel (most important live info),
+    # opportunities second, signals last (often empty).
     layout["right"].split(
+        Layout(name="trades", ratio=3),
         Layout(name="opps", ratio=2),
-        Layout(name="trades", ratio=1),
-        Layout(name="signals", ratio=1),
+        Layout(name="signals", ratio=1, minimum_size=5),
     )
 
     layout["header"].update(_header_panel(state, store))
     layout["strategies"].update(_strategies_panel(state))
     layout["scan"].update(_last_scan_panel(state))
-    layout["opps"].update(_opportunities_panel(state))
     layout["trades"].update(_trades_panel(state))
+    layout["opps"].update(_opportunities_panel(state))
     layout["signals"].update(_signals_panel(state))
     layout["feed"].update(_feed_panel(state))
     return layout
@@ -394,6 +466,8 @@ def run_dashboard(session: Optional[str] = None) -> None:
     console.print(f"[dim]Following {path}[/dim]  (Ctrl-C to exit)")
     state_box = {"state": DashboardState()}
     store = LocalStore()
+    state_box["state"].load_trades(store)
+
     stop = threading.Event()
     t = threading.Thread(target=_reader_thread, args=(path, state_box, stop), daemon=True)
     t.start()

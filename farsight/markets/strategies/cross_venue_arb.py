@@ -26,7 +26,6 @@ from typing import Optional
 from farsight.markets.clients.kalshi.rest_client import KalshiClient
 from farsight.markets.clients.polymarket.gamma_client import GammaClient
 from farsight.markets.strategies.base import (
-    Filter,
     MarketContext,
     Opportunity,
     Source,
@@ -97,6 +96,21 @@ class DualVenueSource(Source):
         return [ctx]
 
 
+from typing import Literal as _Literal
+from pydantic import BaseModel as _BaseModel, Field as _Field
+from farsight.markets.strategies.config import StrategyConfig
+
+
+class CrossVenueParams(_BaseModel):
+    min_spread: float = 0.03
+    min_match_confidence: float = 0.5
+
+
+class CrossVenueConfig(StrategyConfig):
+    name: _Literal["cross_venue"] = "cross_venue"
+    params: CrossVenueParams = _Field(default_factory=CrossVenueParams)
+
+
 class CrossVenueArbitrage(Strategy):
     """Detect price divergences between Polymarket and Kalshi.
 
@@ -114,18 +128,23 @@ class CrossVenueArbitrage(Strategy):
         min_spread: float = 0.03,      # 3% minimum divergence
         min_confidence: float = 0.5,    # Match confidence
         min_liquidity: float = 5000,
+        config: Optional[CrossVenueConfig] = None,
     ):
         gamma = gamma or GammaClient()
         kalshi = kalshi or KalshiClient()
 
+        if config is not None:
+            min_spread = config.params.min_spread
+            min_confidence = config.params.min_match_confidence
+            min_liquidity = config.thresholds.min_liquidity
+            self.scan_interval_seconds = config.scheduling.scan_interval_seconds
+        self.config = config
+
         self.source = DualVenueSource(gamma, kalshi)
         self.matcher = VenueMatcher(min_confidence=min_confidence)
         self.min_spread = min_spread
-        self.quality_filter = Filter(
-            min_edge=min_spread,
-            min_confidence=min_confidence,
-            min_liquidity=min_liquidity,
-        )
+        self.min_confidence = min_confidence
+        self.min_liquidity = min_liquidity
 
     async def scan(self) -> list[Opportunity]:
         """Scan for cross-venue divergences."""
@@ -189,9 +208,15 @@ class CrossVenueArbitrage(Strategy):
             opp.compute_score()
             opportunities.append(opp)
 
-        # 4. Filter and rank
-        filtered = self.quality_filter.filter(opportunities)
-        logger.info(f"CrossVenueArb: {len(opportunities)} divergences → {len(filtered)} after filter")
+        filtered = [
+            o for o in opportunities
+            if abs(o.edge) >= self.min_spread
+            and o.confidence >= self.min_confidence
+            # liquidity check intentionally relaxed — book isn't fetched for
+            # dual-venue matches; Policy enforces sizing floors.
+        ]
+        filtered.sort(key=lambda o: o.score, reverse=True)
+        logger.info(f"CrossVenueArb: {len(opportunities)} divergences → {len(filtered)} qualified")
         return filtered
 
     @staticmethod

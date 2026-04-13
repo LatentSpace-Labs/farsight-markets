@@ -504,20 +504,46 @@ class ResolutionScalper(Strategy):
         take_profit = self.config.risk.take_profit_price
         stop_loss_pct = self.config.risk.stop_loss_pct
 
+        marked = skipped_no_strategy = skipped_no_token = skipped_no_book = 0
+
         for pos in open_positions:
             if pos.get("strategy") != self.name:
+                skipped_no_strategy += 1
                 continue
 
             token_id = pos.get("token_id", "")
             if not token_id:
+                skipped_no_token += 1
                 continue
 
-            book = await self._clob.get_orderbook(token_id)
+            try:
+                book = await self._clob.get_orderbook(token_id)
+            except Exception as e:
+                telemetry.emit("error", strategy=self.name, where="monitor.get_orderbook",
+                               trade_id=pos.get("id"), message=str(e))
+                book = None
             if not book:
+                skipped_no_book += 1
                 continue
+            marked += 1
 
             current_price = book.mid
             entry = pos.get("entry_price", 0)
+            fill = pos.get("fill_price", entry) or 0
+            num_shares = pos.get("num_shares", 0) or 0
+            mtm_value = num_shares * current_price
+            unrealized_pnl = (current_price - fill) * num_shares if pos.get("direction") == "BUY" \
+                             else (fill - current_price) * num_shares
+
+            telemetry.emit(
+                "position.mark", strategy=self.name,
+                trade_id=pos["id"], market_id=pos.get("market_id"),
+                slug=(pos.get("market_question") or "?")[:40],
+                entry=fill, mark=current_price,
+                num_shares=num_shares, size_usd=pos.get("size_usd", 0),
+                mtm_value=round(mtm_value, 2),
+                unrealized_pnl=round(unrealized_pnl, 2),
+            )
 
             if current_price >= take_profit:
                 actions.append(Action(
@@ -534,6 +560,14 @@ class ResolutionScalper(Strategy):
                     exit_price=current_price,
                 ))
 
+        telemetry.emit(
+            "monitor.summary", strategy=self.name,
+            input=len(open_positions), marked=marked,
+            skipped_no_strategy=skipped_no_strategy,
+            skipped_no_token=skipped_no_token,
+            skipped_no_book=skipped_no_book,
+            actions=len(actions),
+        )
         return actions
 
     def get_source(self) -> Source:

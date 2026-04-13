@@ -1,0 +1,32 @@
+# CrossEventArb — structural mispricing in multi-outcome events.
+# Sums outcome prices across an event's child markets. If sum deviates
+# from 100%, the edge is the deviation (markets MUST converge to 100%).
+
+name: arb
+enabled: true
+
+scope:
+  categories: []
+
+thresholds:
+  # min_edge is derived from min_deviation / 10 inside the strategy, so
+  # this acts as a floor rather than the primary gate.
+  min_edge: 0.001
+  min_confidence: 0.40    # confidence scales with deviation size
+  min_liquidity: 5000     # per-leg liquidity floor
+  max_spread: 0.05
+
+risk:
+  max_position_usd: 200
+  max_positions: 6        # arb baskets tie up capital per event
+  stop_loss_pct: 0.03     # arb convergence is structural — tight stop
+  take_profit_price: 0.99 # arbs ride all the way to convergence
+  kelly_fraction: 0.25    # higher confidence → higher Kelly fraction
+
+scheduling:
+  scan_interval_seconds: 600   # 10 min — structural mispricings don't move fast
+  mode: scan
+
+params:
+  max_events: 30           # top-N multi-outcome events by volume
+  min_deviation: 0.02      # ≥2% deviation from 100% sum to consider an arb

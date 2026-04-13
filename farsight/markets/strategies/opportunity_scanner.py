@@ -28,7 +28,6 @@ from farsight.markets.services.theme_service import ThemeService
 from farsight.markets.strategies.base import (
     Analyzer,
     Enricher,
-    Filter,
     MarketContext,
     Opportunity,
     Scorer,
@@ -514,6 +513,23 @@ class SignalScorer(Scorer):
 # ── Composed Strategy ────────────────────────────────────────────────
 
 
+from typing import Literal as _Literal
+from pydantic import BaseModel as _BaseModel, Field as _Field
+from farsight.markets.strategies.config import StrategyConfig
+
+
+class ScannerParams(_BaseModel):
+    max_markets: int = 50
+    min_volume_24h: float = 100
+    price_range_low: float = 0.05
+    price_range_high: float = 0.95
+
+
+class ScannerConfig(StrategyConfig):
+    name: _Literal["scanner"] = "scanner"
+    params: ScannerParams = _Field(default_factory=ScannerParams)
+
+
 class OpportunityScanner(Strategy):
     """Scan top markets for trading opportunities.
 
@@ -530,11 +546,20 @@ class OpportunityScanner(Strategy):
         gamma: Optional[GammaClient] = None,
         clob: Optional[ClobClient] = None,
         max_markets: int = 50,
-        min_edge: float = 0.01,     # Lowered — feature-based opps have smaller edges
+        min_edge: float = 0.01,     # feature-based opps have smaller edges
         min_liquidity: float = 3000,
+        config: Optional[ScannerConfig] = None,
     ):
         gamma = gamma or GammaClient()
         clob = clob or ClobClient()
+
+        # Config overrides raw kwargs when provided.
+        if config is not None:
+            max_markets = config.params.max_markets
+            min_edge = config.thresholds.min_edge
+            min_liquidity = config.thresholds.min_liquidity
+            self.scan_interval_seconds = config.scheduling.scan_interval_seconds
+        self.config = config
 
         # Composable stages
         self.source = TopMarketsSource(gamma, limit=max_markets)
@@ -543,7 +568,8 @@ class OpportunityScanner(Strategy):
         self.feature_analyzer = FeatureAnalyzer()
         self.theme_analyzer = ThemeAnalyzer()
         self.signal_scorer = SignalScorer()
-        self.quality_filter = Filter(min_edge=min_edge, min_liquidity=min_liquidity)
+        self.min_edge = min_edge
+        self.min_liquidity = min_liquidity
 
     async def scan(self) -> list[Opportunity]:
         """Execute the full pipeline."""
@@ -573,9 +599,16 @@ class OpportunityScanner(Strategy):
                 logger.debug(f"Scanner: error processing {ctx.market_question[:40]}: {e}")
                 continue
 
-        # 5. Filter
-        filtered = self.quality_filter.filter(all_opportunities)
-        logger.info(f"OpportunityScanner: {len(all_opportunities)} raw → {len(filtered)} after filter")
+        # Inline quality gates (Scorer+Filter collapsed into the emit step).
+        # Portfolio-level sizing/caps are Policy's job downstream.
+        filtered = [
+            o for o in all_opportunities
+            if abs(o.edge) >= self.min_edge and o.liquidity >= self.min_liquidity
+        ]
+        for o in filtered:
+            o.compute_score()
+        filtered.sort(key=lambda o: o.score, reverse=True)
+        logger.info(f"OpportunityScanner: {len(all_opportunities)} raw → {len(filtered)} qualified")
         return filtered
 
     # Skill extraction
